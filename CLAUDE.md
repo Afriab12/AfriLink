@@ -1,4 +1,4 @@
- # AFRILINK — CLAUDE CODE PROJECT INSTRUCTIONS
+# AFRILINK - CLAUDE CODE PROJECT INSTRUCTIONS
 
 ## Project
 AfriLink is an Africa-first social networking platform.
