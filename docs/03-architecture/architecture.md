@@ -1,454 +1,545 @@
-# AfriLink Technical Architecture
+# AfriLink Architecture Specification
 
-**Status:** Draft — pending product and technology-stack approval
-**Date:** 2026-09-13
-**Scope:** Initial MVP modular monolith; no application code
+**Status:** Architecture specification for review and approval  
+**Date:** 2026-09-13  
+**Scope:** AfriLink MVP; no application source code, migrations, or API implementation
 
-> **Input status:** The technology stack and modular-monolith constraint are approved in `CLAUDE.md`. `docs/01-product/PRD.md` is empty, so product boundaries and capacity targets remain subject to product approval. This document does not overwrite an approved architecture; the existing target file was empty.
+This document defines the technical architecture for the approved MVP in `docs/01-product/PRD.md`. It follows `CLAUDE.md` and preserves the approved stack and modular-monolith constraint. It defines boundaries and responsibilities; it does not implement them.
 
-## 1. Architecture goals and constraints
+## 1. Executive architecture overview
 
-AfriLink is intended to provide social networking infrastructure for African people, communities, creators, and businesses across borders. The first implementation should optimize for:
+AfriLink uses one modular-monolith backend codebase with separate API and worker runtimes. Web and mobile clients consume the same versioned REST/OpenAPI contract. WebSockets provide selected realtime delivery, but PostgreSQL remains authoritative for durable state.
 
-- a coherent MVP and fast iteration;
-- clear module boundaries inside one deployable backend;
-- African and cross-border use cases, including localization, low bandwidth, and unreliable connectivity;
-- privacy, moderation, and abuse resistance from the beginning;
-- a migration path to independently scaled services only when measured load or ownership boundaries justify it.
+The system consists of:
 
-The architecture explicitly **does not** introduce microservices, event streaming infrastructure, or multiple databases for the MVP.
+- Next.js + TypeScript web client.
+- React Native + TypeScript mobile client.
+- NestJS + TypeScript API and worker runtimes.
+- PostgreSQL as the durable relational source of truth.
+- Redis for cache, queues, rate limits, and ephemeral state.
+- S3-compatible private object storage for media.
+- JWT access tokens and rotating refresh tokens.
+- Docker and GitHub Actions for delivery.
+- Sentry and OpenTelemetry for errors, traces, metrics, and operational visibility.
 
-## 2. Approved technology baseline
+The MVP does not introduce microservices, a graph database, a second system of record, or a dedicated search platform. Any exception requires an Architecture Decision Record with evidence, migration impact, ownership, and rollback planning.
 
-These choices are defined by `CLAUDE.md` and guide implementation:
+## 2. Architecture principles
 
-| Concern | Provisional choice | Reason |
-|---|---|---|
-| Web frontend | Next.js + React + TypeScript | SSR/SEO for public profiles and communities; one typed frontend stack |
-| Mobile | React Native with Expo + TypeScript | Shared domain/UI knowledge with web; iOS and Android delivery |
-| Backend | NestJS + TypeScript, modular monolith | Explicit modules, validation, dependency injection, and one deployable API |
-| Primary database | PostgreSQL | Relational integrity for identity, permissions, moderation, and transactions |
-| ORM/migrations | Prisma | Typed access and versioned migrations |
-| Cache/queue | Redis + BullMQ | Cache, rate-limit counters, and durable background jobs |
-| Object storage | S3-compatible storage | Media durability and CDN integration without storing blobs in PostgreSQL |
-| API | Versioned REST/JSON; WebSocket gateway for realtime messaging | Simple mobile/web integration and selective realtime behavior |
-| Search | PostgreSQL full-text search initially | Avoid an additional operational dependency; extract later if required |
-| Observability | OpenTelemetry, structured logs, metrics, traces | Vendor-neutral instrumentation |
-| Delivery | Docker, managed PostgreSQL/Redis/object storage, CDN, CI/CD | Reproducible deployments with low operational overhead |
+1. **Product alignment:** Support African discovery, country-based discovery, communities, cross-border connection, creators, businesses, and cultural context without adding unapproved scope.
+2. **Modular monolith first:** Keep one deployable backend until measured scaling, reliability, ownership, or release boundaries justify extraction.
+3. **Clear ownership:** Each module owns its business rules and persistence boundary.
+4. **PostgreSQL authority:** Durable user, relationship, content, messaging, moderation, and audit state lives in PostgreSQL.
+5. **Derived state is rebuildable:** Caches, feeds, counters, notifications, search projections, and queues can be regenerated.
+6. **Secure by default:** Authentication, authorization, privacy, moderation, validation, and auditability are part of every journey.
+7. **API contract first:** Web and mobile use versioned REST/OpenAPI contracts with explicit DTOs and stable error semantics.
+8. **Async where appropriate:** Media, notifications, projections, and non-critical work use idempotent jobs.
+9. **Low-bandwidth aware:** Clients use bounded payloads, cursor pagination, compressed media, retries, and degraded states.
+10. **Measured evolution:** Performance and scaling changes follow observed demand, not speculation.
 
-Any change to this stack requires an architecture decision record that explains the reason and impact.
-
-## 3. System architecture
-
-The system is a modular monolith with one API runtime, one worker runtime from the same codebase, PostgreSQL as the system of record, Redis for ephemeral/derived state, and object storage for media. The web and mobile clients use the same public API.
+## 3. System architecture diagram
 
 ```mermaid
 flowchart TB
-	Web[Web client\nNext.js] --> CDN[CDN/WAF]
-	Mobile[Mobile clients\nReact Native] --> CDN
-	CDN --> API[API runtime\nNestJS modular monolith]
-	API --> DB[(PostgreSQL)]
-	API --> Cache[(Redis)]
-	API --> Store[(S3-compatible media storage)]
-	API --> Jobs[(Redis job queues)]
-	Jobs --> Worker[Worker runtime\nsame modular monolith]
-	Worker --> DB
-	Worker --> Cache
-	Worker --> Store
-	Worker --> Providers[Email/SMS/push providers]
-	API --> Providers
-	API --> Obs[Logs, metrics, traces]
-	Worker --> Obs
+    Web[Next.js web] --> Edge[DNS / TLS / CDN / WAF]
+    Mobile[React Native mobile] --> Edge
+    Edge --> API[NestJS API runtime]
+    Edge --> WS[WebSocket gateway]
+    API --> Modules[Modular monolith modules]
+    WS --> Modules
+    Modules --> PG[(PostgreSQL source of truth)]
+    Modules --> Redis[(Redis cache / queues / ephemeral state)]
+    Modules --> Storage[(Private S3-compatible storage)]
+    Modules --> Outbox[(Transactional outbox)]
+    Outbox --> Worker[NestJS worker runtime]
+    Worker --> PG
+    Worker --> Redis
+    Worker --> Storage
+    Worker --> Providers[Email / SMS / push / media / safety providers]
+    API --> Providers
+    API --> Obs[Sentry / OpenTelemetry]
+    Worker --> Obs
 ```
 
 ### Runtime boundaries
 
-1. **Edge:** DNS, TLS, WAF, CDN, request size limits, and basic bot/rate controls.
-2. **API runtime:** authentication, authorization, synchronous commands/queries, and WebSocket connections.
-3. **Worker runtime:** notifications, media processing, feed fan-out, moderation scans, cleanup, and retries.
-4. **Persistence:** PostgreSQL transactions; Redis for derived or short-lived state; object storage for binary assets.
-5. **External providers:** email, SMS/OTP, push notification, image/video processing, and optional content-safety providers.
+- **Edge:** TLS, CDN, WAF, request-size limits, bot controls, and coarse rate controls.
+- **API:** REST controllers, authentication, authorization, synchronous commands/queries, and WebSocket connections.
+- **Worker:** Outbox publication, notifications, media processing, feed/search projections, moderation assistance, cleanup, and retries.
+- **Persistence:** PostgreSQL transactions, Redis derived state, and object-storage media.
+- **Providers:** Internal adapters normalize external verification, notification, media, and safety services.
 
 ## 4. Frontend architecture
 
-- Organize the web client by feature: identity, profile, feed, post, community, messaging, notifications, search, moderation, and admin.
-- Keep server state in a query/cache layer and local UI state in component or feature stores; do not duplicate server truth in global state.
-- Use server rendering or static generation for public profiles and public community pages; use authenticated client fetching for private timelines and messages.
-- Centralize API client generation, authentication refresh, error mapping, pagination, feature flags, and telemetry.
-- Use cursor pagination, image placeholders, responsive layouts, accessible controls, and optimistic updates only for reversible interactions such as likes.
-- Enforce authorization on the API; frontend guards are for user experience, not security.
+The Next.js application is organized by capability: identity, profiles, relationships, feed, posts, comments, reactions, shares, Discover, country discovery, communities, messaging, notifications, search, settings/privacy, moderation, and admin.
+
+- Use a centralized typed API client for authentication refresh, request correlation, errors, pagination, feature flags, and telemetry.
+- Keep server state in a query/cache layer and local interaction state within features/components.
+- Use server rendering or static generation for permitted public profiles, communities, posts, and discovery pages.
+- Use authenticated client fetching for private feeds, messages, notifications, settings, moderation, and admin.
+- Frontend guards improve experience only; server authorization is mandatory.
+- Implement loading, empty, error, retry, restricted, deleted, offline, and degraded states.
+- Build accessibility into every feature: semantic controls, keyboard operation, focus management, contrast, labels, and assistive-technology support.
 
 ## 5. Mobile architecture
 
-- React Native/Expo application with feature-based modules and shared TypeScript API/domain types where practical.
-- Persist only encrypted session material and explicitly offline-safe data; never persist access tokens in ordinary plaintext storage.
-- Use a small offline outbox for post reactions, follows, and message sends. Each command needs an idempotency key and a visible retry/conflict state.
-- Compress and resumably upload media; defer nonessential media and feed images on metered connections.
+The React Native application uses feature modules matching the web product areas and shares generated API/domain types where practical.
+
+- Store refresh credentials only in OS-protected secure storage.
+- Maintain a bounded offline outbox for retryable reactions, relationship actions, posts where approved, and messages.
+- Use idempotency keys or client command IDs for retryable writes and show pending, retry, conflict, and failure states.
+- Use cursor synchronization for feeds, messages, notifications, search, and community lists.
+- Compress and resumably upload media; defer nonessential media on metered connections.
 - Support deep links for profiles, posts, communities, and conversations.
-- Integrate APNs/FCM through a notification abstraction rather than exposing provider details to feature modules.
+- Hide APNs/FCM behind a notification adapter.
+- Reconcile optimistic state with the server after reconnect; the server is authoritative.
 
 ## 6. Backend architecture
 
-The NestJS application is a single deployable modular monolith. Modules communicate through typed application services and domain events, not direct access to another module's tables.
+The NestJS backend is a modular monolith with independently deployable API and worker processes built from the same codebase.
 
-Recommended layers inside each module:
+Each module uses four layers:
 
-- **Presentation:** REST controllers, WebSocket handlers, DTO validation, and serializers.
-- **Application:** use cases, transaction boundaries, authorization checks, idempotency handling.
-- **Domain:** entities, value objects, policies, and domain events.
-- **Infrastructure:** Prisma repositories, provider adapters, queue publishers, and storage adapters.
+1. **Presentation:** REST controllers, WebSocket handlers, DTO validation, serializers, and OpenAPI metadata.
+2. **Application:** Use cases, transaction boundaries, authorization, idempotency, and orchestration.
+3. **Domain:** Invariants, policies, entities/value objects, and versioned domain events.
+4. **Infrastructure:** Prisma repositories, PostgreSQL, Redis, queues, object storage, external adapters, and telemetry.
 
-The worker imports application services through the same module boundaries. Jobs are commands with retry policy and idempotency, not arbitrary database scripts.
+Controllers do not contain business rules or direct database queries. Modules communicate through application interfaces and typed events, never arbitrary reads of another module's tables. External calls do not hold database locks.
 
-## 7. Module diagram
+## 7. Modular monolith module structure
 
 ```mermaid
 flowchart LR
-	Identity[Identity & Access]
-	Profile[Profiles & Connections]
-	Content[Posts & Comments]
-	Feed[Feed]
-	Community[Communities]
-	Messaging[Messaging]
-	Notify[Notifications]
-	Media[Media]
-	Moderation[Moderation]
-	Admin[Admin & Audit]
-	Search[Search]
-
-	Identity --> Profile
-	Identity --> Content
-	Identity --> Community
-	Identity --> Messaging
-	Profile --> Feed
-	Content --> Feed
-	Community --> Feed
-	Content --> Media
-	Profile --> Media
-	Messaging --> Notify
-	Content --> Notify
-	Community --> Notify
-	Moderation --> Content
-	Moderation --> Profile
-	Moderation --> Community
-	Admin --> Moderation
-	Admin --> Identity
-	Search --> Profile
-	Search --> Content
-	Search --> Community
+    Identity[Identity & Access] --> Profiles[Profiles]
+    Identity --> Social[Friendships / Follows / Blocks]
+    Identity --> Content[Posts / Comments / Reactions / Shares]
+    Identity --> Communities[Communities]
+    Identity --> Messaging[Messaging]
+    Profiles --> Discover[Discover / Countries / Interests]
+    Social --> Feed[Feed]
+    Content --> Feed
+    Communities --> Feed
+    Content --> Media[Media]
+    Messaging --> Media
+    Content --> Search[Search]
+    Profiles --> Search
+    Communities --> Search
+    Content --> Notifications[Notifications]
+    Social --> Notifications
+    Communities --> Notifications
+    Messaging --> Notifications
+    Content --> Moderation[Reports / Moderation]
+    Messaging --> Moderation
+    Communities --> Moderation
+    Social --> Moderation
+    Moderation --> Admin[Admin / Audit]
+    Identity --> Admin
 ```
 
-### Module ownership rules
-
-| Module | Owns | May publish |
+| Module | Owns | Key events/contracts |
 |---|---|---|
-| Identity & Access | users, credentials, sessions, roles | `UserRegistered`, `UserSuspended` |
-| Profiles & Connections | profiles, follows, blocks | `FollowCreated`, `BlockCreated` |
-| Posts & Comments | posts, comments, reactions | `PostPublished`, `CommentCreated` |
-| Feed | feed entries, ranking metadata | `FeedRebuildRequested` |
-| Communities | communities, memberships, community roles | `MembershipChanged` |
-| Messaging | conversations, participants, messages, read state | `MessageSent` |
-| Notifications | preferences, in-app notifications, delivery records | `NotificationRequested` |
-| Media | assets, variants, upload state | `MediaReady`, `MediaRejected` |
-| Moderation | reports, cases, decisions, sanctions | `ContentActioned` |
-| Admin & Audit | administrative actions and audit records | `AuditRecorded` |
-| Search | search projections/index metadata | `SearchProjectionUpdated` |
+| Identity & Access | Users, credentials, verification, sessions, account state, platform roles | `UserRegistered`, `UserVerified`, `AccountStateChanged` |
+| Profiles | Public identity, profile data, privacy preferences | `ProfileUpdated` |
+| Friendships | Friend requests and mutual relationship state | `FriendshipChanged` |
+| Follows | Directed follows and visibility | `FollowChanged` |
+| Blocking | User blocks and suppression policy | `BlockChanged` |
+| Countries & Interests | Reference data and user selections | Discovery eligibility changes |
+| Content | Posts, comments, reactions, shares, visibility | `PostPublished`, `ContentChanged` |
+| Feed | Derived feed entries, hide state, ranking metadata | Consumes social/content/community events |
+| Discover | Explainable discovery candidates and surfaces | Consumes eligible public projections |
+| Media | Upload reservations, assets, variants, processing state | `MediaReady`, `MediaRejected` |
+| Communities | Communities, memberships, rules, scoped roles | `MembershipChanged`, `CommunityChanged` |
+| Messaging | Conversations, participants, messages, read state | `MessageAccepted`, `ConversationChanged` |
+| Notifications | In-app records, preferences, delivery records | Consumes domain events |
+| Search | Search projections and indexing state | Consumes eligible public changes |
+| Moderation | Reports, cases, decisions, sanctions, appeals | `ContentActioned` |
+| Admin & Audit | Admin workflows, feature flags, audit records | Security and moderation audit events |
+| Privacy | Visibility, consent, retention, deletion policy interfaces | Enforced by owning use cases |
 
-## 8. Database architecture
+Every cross-module event is versioned, typed, idempotently consumed, and tested.
 
-PostgreSQL is the transactional source of truth. Use one database initially, with a schema organized by ownership (`identity`, `social`, `content`, `community`, `messaging`, `notification`, `moderation`, `media`, `audit`, and `search`) or an equivalent table prefix convention.
+## 8. Database architecture overview
 
-Core entities:
+PostgreSQL is the only durable relational source of truth for the MVP. Use one database initially with ownership-separated schemas or equivalent naming:
 
-- `users`, `credentials`, `sessions`, `roles`, `user_roles`;
-- `profiles`, `follows`, `blocks`;
-- `posts`, `comments`, `reactions`, `post_visibility`;
-- `communities`, `community_memberships`, `community_roles`;
-- `conversations`, `conversation_members`, `messages`, `message_receipts`;
-- `notifications`, `notification_preferences`, `delivery_attempts`;
-- `media_assets`, `media_variants`, `upload_parts`;
-- `reports`, `moderation_cases`, `moderation_actions`, `audit_events`.
+`identity`, `profile`, `social`, `content`, `feed`, `community`, `messaging`, `notification`, `media`, `moderation`, `admin`, `audit`, `search`, and `integration`.
 
-Rules:
+- Use foreign keys, unique constraints, validation constraints, indexes, migrations, and audit fields.
+- Use non-sequential public identifiers.
+- Commit authoritative mutations and outbox records atomically.
+- Keep feeds, counters, notifications, projections, and caches rebuildable.
+- Store timestamps consistently and preserve country, language, locale, and timezone preferences.
+- Apply explicit lifecycle, deletion, evidence, retention, and legal-hold policy.
+- Use Prisma as the ORM/migration direction recorded in the existing architecture decisions, but do not create migrations in this task.
 
-- UUID/ULID public identifiers; never expose sequential internal IDs as public identity.
-- Foreign keys and unique constraints enforce ownership, membership, and idempotency.
-- Soft deletion is explicit and policy-driven; retain minimum audit/legal records separately.
-- Store timestamps in UTC; store user locale, language, and timezone as profile preferences.
-- Use cursor indexes for `(created_at, id)` and relationship indexes for feed, membership, and messaging queries.
-- Use an outbox table in PostgreSQL so committed domain changes reliably produce background jobs.
-- Encrypt sensitive fields selectively and keep secrets outside the database.
+## 9. REST API architecture overview
 
-## 9. API architecture
+The public contract is versioned REST/JSON under `/api/v1` and described by reviewed OpenAPI schemas.
 
-Use `/api/v1` REST endpoints with consistent envelopes, validation, pagination, and error codes. Use WebSockets only for message delivery, typing/presence where approved, and notification updates; all state changes remain REST/application commands.
+- REST is authoritative for commands and ordinary queries.
+- Controllers call application services and return explicit DTOs.
+- Validate bodies, path/query parameters, content types, and upload instructions at the boundary.
+- Use stable machine-readable error codes and generic disclosure-safe errors.
+- Use opaque cursor pagination with bounded limits for large collections.
+- Require `Idempotency-Key` or equivalent client command IDs for retryable writes.
+- Apply authentication, authorization, privacy, block, moderation, validation, error, pagination, and rate-limit policy per endpoint.
+- Prefer additive changes; breaking changes require a new version or approved compatibility plan.
 
-Examples of resource areas:
-
-- `/auth`, `/users`, `/profiles`, `/follows`, `/blocks`;
-- `/posts`, `/comments`, `/reactions`, `/feed`;
-- `/communities`, `/memberships`;
-- `/conversations`, `/messages`;
-- `/notifications`, `/media/uploads`;
-- `/reports`, `/admin`.
-
-API requirements:
-
-- OpenAPI is generated and reviewed as a contract.
-- Validate payloads and content types at the edge and controller boundary.
-- Use cursor pagination and bounded page sizes.
-- Support `Idempotency-Key` on retryable commands, especially uploads, posts, follows, and messages.
-- Return generic authentication and authorization errors where disclosure could aid abuse.
-- Apply per-user, IP, endpoint, and resource rate limits.
-- Version breaking changes; prefer additive changes.
+Resource areas include `/auth`, `/users`, `/profiles`, `/friends`, `/follows`, `/blocks`, `/posts`, `/comments`, `/reactions`, `/shares`, `/feed`, `/discover`, `/countries`, `/communities`, `/conversations`, `/messages`, `/notifications`, `/media`, `/search`, `/reports`, `/moderation`, and `/admin`.
 
 ## 10. Authentication architecture
 
-- Use short-lived access tokens and rotating refresh tokens stored server-side as hashes, with device/session revocation.
-- Passwords use a memory-hard password hash such as Argon2id; never log credentials or tokens.
-- Email/phone verification and OTP flows are separate, rate-limited, single-use, and expiry-bound.
-- Add optional MFA for users and mandatory MFA for administrators.
-- Use secure, HttpOnly, SameSite cookies for web sessions where appropriate; use OS-protected secure storage for mobile refresh credentials.
-- Authorization combines account status, resource ownership, visibility, relationship state, community role, and moderation sanctions.
-- Maintain an audit trail for login, credential changes, session revocation, role changes, and admin actions.
+- Use short-lived JWT access tokens and rotating refresh tokens.
+- Store refresh-token representations as hashes and support device/session revocation.
+- Hash passwords with a memory-hard algorithm such as Argon2id; never log credentials or tokens.
+- Make verification and recovery challenges single-use, expiry-bound, and rate-limited.
+- Use secure HttpOnly/SameSite cookies where web policy selects cookies and OS-protected storage for mobile refresh credentials.
+- Require MFA and recent re-authentication for sensitive administrator actions.
+- Audit login, verification, recovery, credential changes, session revocation, role changes, and administrative actions.
 
-## 11. Social graph architecture
+## 11. Authorization/RBAC
 
-Represent follows as a directed edge with uniqueness on `(follower_id, followee_id)`. Blocks are higher-priority negative edges and must suppress profile discovery, feed items, messaging, and notifications according to policy.
+Authorization is enforced in application use cases and combines authentication/account state, resource ownership, relationship, visibility, block state, moderation sanctions, community role scope, and field-level disclosure.
 
-- Keep graph mutations transactional and idempotent.
-- Maintain counts as derived values; repair them asynchronously from source edges.
-- Start with PostgreSQL joins and denormalized counters. Do not add a graph database for the MVP.
-- Model privacy states such as public, followers-only, community-only, and private.
-- Apply block and moderation filters before ranking or returning content.
+Platform roles are separate from community roles. Platform RBAC is least privilege and may include support, moderator, senior moderator, operations, and security administrator roles. Community roles are scoped to one community and cannot grant platform authority. Admin actions require MFA, recent re-authentication for sensitive operations, and audit records. The exact role matrix remains an open product/operations decision.
 
-## 12. Feed architecture
+## 12. Social graph architecture
 
-Use a hybrid feed:
+Friendships, follows, and blocks are separate relationship types.
 
-1. Publish a post transactionally and emit `PostPublished` through the outbox.
-2. A worker fans out a bounded number of feed entries to active followers and relevant community members.
-3. For high-fan-out accounts, use pull-on-read rather than writing to every follower.
-4. At read time, merge precomputed entries with pull sources, apply visibility/block/moderation filters, rank, and cursor paginate.
+- Friendships support request, accept, decline, remove, and policy-controlled visibility.
+- Follows are directed and independently managed.
+- Blocks suppress discovery, feeds, messaging, notifications, and interaction according to policy.
+- Relationship mutations are transactional and idempotent.
+- Derived counts are repairable from authoritative relationships.
+- Authorization checks relationship, visibility, account state, blocks, and moderation before reads or writes.
+- Use PostgreSQL relationships and indexes; do not add a graph database for MVP.
 
-MVP ranking should be deterministic and explainable: recency, relationship strength, community membership, language/region preference, and basic engagement signals. Avoid opaque personalization until data quality, consent, and safety controls are established.
+The product must still finalize exact friend/follow visibility and messaging semantics.
 
-## 13. Messaging architecture
+## 13. Feed architecture
 
-- Conversations and membership are relational; messages are append-only records with sender, client idempotency key, timestamps, and moderation state.
-- REST creates messages; WebSockets deliver accepted messages to connected participants. The database remains authoritative.
-- Reconnect using a message cursor; clients acknowledge delivery/read separately.
-- Presence and typing indicators are ephemeral Redis keys with short TTLs and must not be treated as durable facts.
-- Attachments use the Media module and signed upload URLs; messages reference media IDs, not provider URLs.
-- Apply block, membership, report, retention, and abuse controls before delivery.
+Use a deterministic, explainable hybrid feed:
 
-## 14. Notification architecture
+1. Content commits a post and `PostPublished` in one transaction.
+2. Workers create bounded feed entries for active eligible relationships and communities.
+3. High-fan-out authors use pull-on-read rather than unbounded fan-out.
+4. Reads merge projections and pull sources, then apply privacy, block, account, community, and moderation filters before ranking.
+5. Results use cursor pagination.
+6. Deletions, hides, blocks, sanctions, and privacy changes trigger invalidation or rebuild work.
 
-Notifications are generated from domain events, deduplicated, preference-filtered, and delivered asynchronously.
+Initial signals may include recency, relationship strength, community membership, country/language relevance, and basic engagement. Opaque personalization is excluded from MVP. Freshness, cold-start behavior, and ranking weights remain open decisions.
+
+## 14. Messaging architecture
+
+- Conversations and membership are relational and owned by Messaging.
+- REST creates messages; WebSockets deliver accepted events to authorized connected participants.
+- PostgreSQL is authoritative; clients recover missed messages through cursors after reconnect.
+- Message sends use client idempotency keys.
+- Delivery/read state is separate from message acceptance.
+- Presence and typing are short-lived Redis signals, never durable facts.
+- Attachments reference approved Media assets.
+- Conversation creation, participants, sends, and delivery enforce relationship, privacy, block, membership, sanction, reporting, and retention rules.
+
+## 15. Notification architecture
+
+Notifications are created asynchronously from domain events.
 
 - In-app notifications are durable PostgreSQL records.
-- Push, email, and SMS are provider adapters with retry/backoff and delivery status.
-- Store category, channel, locale, quiet hours, and consent preferences.
-- Collapse noisy events, such as repeated reactions, into summaries.
-- Never include sensitive message content in push payloads by default.
+- Push, email, and SMS are provider adapters with retry, backoff, delivery state, and reconciliation.
+- Preferences control category, channel, consent, locale, and quiet hours where supported.
+- Repeated activity is grouped or collapsed according to product policy.
+- Notification creation re-checks recipient visibility, block state, and account state.
+- Push payloads contain no sensitive message content by default.
 
-## 15. Media architecture
+## 16. Media/file architecture
 
-1. API authorizes an upload and creates a pending `media_asset`.
-2. Client uploads directly to private object storage using a short-lived signed URL.
-3. Storage events or a completion call enqueue validation and processing.
-4. Workers verify type/size, malware-scan where available, strip unsafe metadata, generate variants/thumbnails, and mark the asset ready or rejected.
-5. CDN serves only approved variants through signed or policy-controlled URLs.
+1. The API authorizes owner, purpose, type, size, and quota and creates a pending asset.
+2. The client uploads directly to private S3-compatible storage using short-lived signed instructions.
+3. Completion queues validation and processing.
+4. Workers verify type, size, checksum, dimensions, and duration; scan where available; strip unsafe metadata; and create variants.
+5. Only ready and policy-approved variants become referenceable or deliverable.
+6. Deletion and orphan cleanup follow reference and retention policy.
 
-Set quotas, content-type allowlists, maximum dimensions, retention policies, and orphan cleanup. Never trust a filename or client MIME type.
+Never trust filenames or client MIME declarations. Exact limits, video duration, safety provider, processing targets, and retention periods remain open decisions.
 
-## 16. Community architecture
+## 17. Community architecture
 
-Communities have an owner, moderators, membership policy, visibility, rules, and moderation settings. Membership transitions are stateful and audited.
+Communities own profile, visibility, rules, membership, invitations, and scoped roles.
 
-- Public communities permit discovery; private communities require invitation or approval.
-- Community roles are scoped and cannot grant platform-wide privileges.
-- Community feeds reuse the Content and Feed modules but apply community visibility and membership filters.
-- Moderators can manage community content and members within scope; platform admins handle escalations.
+- Public communities are discoverable; private communities require approved join or invitation flows.
+- Membership transitions are stateful, authorized, and audited.
+- Owners and moderators act only within community scope.
+- Community content reuses Content and Feed contracts with membership checks.
+- Serious cases escalate to platform Moderation.
+- Private communities, pending memberships, and restricted activity do not leak through search, feed, notifications, or errors.
 
-## 17. Moderation architecture
+## 18. Search architecture
 
-Moderation is a first-class workflow, not only an admin screen.
+The MVP begins with PostgreSQL full-text search and search-owned projections. Search indexes only eligible profiles, communities, and public content.
 
-- Users can report content, profiles, messages, and communities with categorized reasons.
-- Reports enter a queue with deduplication, priority, SLA, assignment, evidence, and immutable decision history.
-- Automated checks may flag content, but MVP enforcement requires policy-based actions and human review for consequential decisions.
-- Actions include label, reduce distribution, remove, restrict, suspend, and ban; every action has actor, reason, scope, duration, and appeal state.
-- Preserve evidence access controls and minimize sensitive retention.
-- Provide user-facing status and appeal flows where policy requires them.
+- Projections update asynchronously from approved source changes.
+- Results are rechecked against source visibility, account state, blocks, moderation, deletion, and privacy before return.
+- Search supports bounded queries, safe limits, abuse controls, and useful no-result states.
+- Country, language, and community context may be indexed where approved.
+- A dedicated search platform is a future option only after measured relevance, language, or latency limits justify it.
 
-## 18. Admin architecture
+## 19. Country-discovery architecture
 
-The admin console is a separate frontend area using the same API with stronger authorization and mandatory audit logging.
+Countries and Interests own supported reference data and user selections. Discover consumes those signals to build explainable public discovery surfaces.
 
-- Use least-privilege roles: support, moderator, senior moderator, operations, and security administrator.
-- Require MFA, recent re-authentication for sensitive actions, scoped permissions, and dual control for irreversible platform actions where feasible.
-- Provide case queues, user/content lookup, sanctions, appeals, feature flags, provider health, and audit search.
-- Do not allow direct production database editing through the admin UI.
+- Profiles may expose country/region context according to privacy settings.
+- Users can explore eligible people, communities, and content associated with another country or region.
+- Country discovery supports cross-border exploration and does not imply identity or country verification unless explicitly approved.
+- Results respect language, privacy, blocks, account state, and moderation.
+- Country and region data is reference-controlled rather than free-form authorization data.
 
-## 19. Security architecture
+Initial countries, region granularity, language support, verification, and ranking signals remain open decisions.
 
-Apply defense in depth:
+## 20. Moderation architecture
 
-- TLS everywhere, secure headers, WAF rules, CSRF protection for cookie-authenticated web commands, and strict CORS.
-- Central input validation, output encoding, safe markdown/HTML sanitization, SSRF protection, and upload scanning.
-- Secrets in a managed secret store; separate environments and credentials.
-- Encryption at rest through managed services and field-level encryption for high-risk data.
-- Tenant/resource authorization checks in every use case; test for IDOR and privilege escalation.
-- Rate-limit authentication, OTP, posting, messaging, reporting, search, and media operations.
-- Minimize PII, define retention/deletion workflows, and document data residency and cross-border transfer requirements.
-- Dependency, container, secret, and schema migration scans in CI.
-- Incident response includes credential revocation, moderation escalation, evidence preservation, and user communication.
+Moderation is a first-class workflow for profiles, posts, comments, shares, messages, and communities.
 
-## 20. Caching strategy
+- Reports create categorized cases with deduplication, priority, assignment, status, evidence access, and response tracking.
+- Automated signals may assist triage but do not silently make consequential decisions.
+- Actions are scoped, policy-driven, time-bounded where appropriate, and auditable.
+- User-facing status and appeals exist where approved policy requires them.
+- Evidence is minimized, access-controlled, and retained separately from ordinary user-visible deletion.
+- Blocks, sanctions, and actions apply consistently to discovery, feed, messaging, notifications, and communities.
 
-Redis is a performance layer, never the source of truth.
+Moderation taxonomy, sanctions, appeals, legal escalation, staffing, and service levels require product and legal approval.
 
-- Cache public profile/community summaries, feature flags, permission snapshots, and expensive read models with short TTLs.
-- Use namespaced keys, bounded values, jittered TTLs, and explicit invalidation on critical mutations.
-- Cache feed pages only when invalidation and privacy filtering are safe; prefer per-user feed entries for consistency.
-- Use Redis counters for rate limits and ephemeral presence.
-- Prevent cache stampedes with request coalescing or short locks.
-- Do not cache private responses across users or before authorization.
+## 21. Admin architecture
 
-## 21. Background-job strategy
+The admin dashboard is a protected web feature area using the same API with stronger authorization and mandatory audit logging. It provides authorized operators with report/case queues, controlled user/profile/content/community/account lookup, sanctions, appeals, provider and queue health, approved operational settings, feature flags, and role-appropriate audit search.
 
-Use an outbox publisher plus BullMQ queues. Suggested queues:
+It exposes no secrets, raw credentials, arbitrary SQL, or unscoped production edits. Exact roles, support workflows, and operational metrics remain open decisions.
 
-- `feed`: fan-out, ranking rebuild, counter repair;
-- `notifications`: in-app creation, push/email/SMS delivery;
-- `media`: scan, transcode, thumbnail, cleanup;
-- `moderation`: automated checks, report prioritization, retention;
-- `search`: projection updates and reindexing;
-- `maintenance`: expired sessions, orphan cleanup, data repair.
+## 22. Redis/cache strategy
 
-Each job has an idempotency key, retry/backoff policy, timeout, dead-letter handling, metrics, and a runbook. Backpressure and queue lag must be visible before increasing worker concurrency.
+Redis is never authoritative.
 
-## 22. Observability strategy
+- Cache public profile/community summaries, approved discovery read models, feature flags, permission snapshots, and safe derived reads with bounded TTLs.
+- Use namespaced keys, size limits, jittered expiry, and explicit invalidation for critical mutations.
+- Cache feed pages only when privacy and invalidation are safe; prefer per-user feed projections.
+- Use counters for rate limits and short-lived keys for presence/typing.
+- Use request coalescing or narrow locks to reduce stampedes.
+- Never cache private responses across users or before authorization.
+- Every cache/projection has a rebuild or source-of-truth recovery path.
 
-- Structured JSON logs with request ID, trace ID, actor classification, route, status, latency, and error code; never log secrets or message bodies.
-- OpenTelemetry traces across API, database, Redis, queues, storage, and external providers.
-- Metrics for latency/error rate, database pool use, cache hit rate, queue lag, job failures, feed generation, upload failures, authentication abuse, and moderation SLAs.
-- Dashboards and alerts for availability, saturation, data freshness, provider failures, and security anomalies.
-- Define SLOs after product traffic assumptions are known; begin with API availability, p95 latency, job completion, and notification delivery targets.
-- Correlate audit events with traces without exposing sensitive content.
+## 23. Background jobs
 
-## 23. Deployment architecture
+The transactional outbox publishes at-least-once events to Redis/BullMQ queues:
+
+- `feed`: fan-out, ranking refresh, rebuilds, counter repair.
+- `notifications`: in-app creation and provider delivery.
+- `media`: validation, scanning, processing, variants, cleanup.
+- `moderation`: triage signals, prioritization, retention, safety assistance.
+- `search`: projection updates and reindexing.
+- `maintenance`: session expiry, deletion, orphan cleanup, repairs.
+
+Every job has a version, idempotency key, retry/backoff, timeout, dead-letter behavior, structured metrics, and a runbook. Queue lag, retries, and failures are observable before concurrency changes.
+
+## 24. WebSocket architecture
+
+WebSockets are a delivery channel, not a second write API.
+
+- Authenticate during connection establishment and authorize every channel/subscription.
+- Deliver only events the connection is currently permitted to see.
+- Initial durable events may include accepted/updated/deleted messages, read-state changes, and notification creation.
+- Presence and typing may be ephemeral best-effort events backed by Redis TTLs.
+- Events include event ID, type, resource ID, version, and server timestamp.
+- Clients reconnect using durable cursors and recover through REST.
+- Connection limits, heartbeat, backpressure, reconnect, and abuse controls are required.
+
+## 25. Security architecture
+
+Defense in depth includes TLS, secure headers, strict CORS, WAF controls, CSRF protection for cookie-authenticated changes, central validation, output encoding, safe rich-text handling, SSRF protection, media scanning, resource-level authorization, IDOR/privilege tests, layered rate limits, managed secrets, isolated credentials, encryption at rest, redacted logs/traces, dependency/container/secret/migration scanning, and incident response.
+
+Incident response covers credential revocation, evidence preservation, moderation escalation, and user communication. Secrets, tokens, passwords, private user information, and unnecessary PII must not appear in source control, logs, notifications, analytics, errors, or public URLs.
+
+## 26. Observability and monitoring
+
+Use Sentry for application errors and OpenTelemetry for traces and metrics.
+
+- Structured logs contain request/trace IDs, actor classification, route template, status, latency, error code, and dependency timing without sensitive payloads.
+- Trace API, database, Redis, queues, storage, and external providers.
+- Monitor latency/error rates, database pool/locks, cache hit rate, queue lag, job failures, feed freshness, upload failures, authentication abuse, message delivery, notification delivery, moderation response, and provider health.
+- Alert on availability, saturation, data freshness, security anomalies, failed jobs, and recovery health.
+- Define numeric SLOs after launch traffic, capacity, RPO, and RTO decisions are approved.
+
+## 27. Deployment architecture
 
 ```mermaid
 flowchart LR
-	Git[Git repository] --> CI[CI: test, lint, scan, build]
-	CI --> Registry[Container registry]
-	Registry --> Staging[Staging environment]
-	Staging --> Approval[Review/approval]
-	Approval --> Prod[Production runtime]
-	Prod --> Edge[CDN/WAF]
-	Edge --> API[API containers]
-	Prod --> Worker[Worker containers]
-	API --> PG[(Managed PostgreSQL)]
-	API --> Redis[(Managed Redis)]
-	API --> S3[(Object storage)]
-	Worker --> PG
-	Worker --> Redis
-	Worker --> S3
+    Git[GitHub repository] --> Actions[GitHub Actions]
+    Actions --> Checks[Tests / lint / typecheck / scans]
+    Checks --> Registry[Container registry]
+    Registry --> Staging[Staging API + worker]
+    Staging --> Approval[Release approval]
+    Approval --> Production[Production]
+    Production --> Edge[CDN / WAF]
+    Edge --> API[Stateless API replicas]
+    Production --> Worker[Worker replicas]
+    API --> PG[(Managed PostgreSQL)]
+    API --> Redis[(Managed Redis)]
+    API --> S3[(S3-compatible storage)]
+    Worker --> PG
+    Worker --> Redis
+    Worker --> S3
 ```
 
-Environment separation:
+- Build and scan Docker images in GitHub Actions.
+- Require tests, type checks, lint, contract checks, security scans, and migration compatibility checks.
+- Scale API and worker runtimes independently from the same codebase.
+- Use health/readiness probes, graceful shutdown, rolling or blue/green releases, and rollback/forward-fix procedures.
+- Use encrypted backups, point-in-time recovery, restore drills, and private database/network placement.
+- Never couple destructive schema changes to the first application release that requires them.
 
-- Local: Docker Compose dependencies and safe development providers.
-- CI: ephemeral or isolated test database; migrations and contract tests.
-- Staging: production-like configuration and seeded non-PII data.
-- Production: private database/network placement, managed backups, point-in-time recovery, autoscaling stateless API/worker containers, and CDN.
+## 28. Repository/folder architecture
 
-Deployment requirements include backward-compatible migrations, health/readiness probes, graceful shutdown, rolling or blue/green release, automated rollback, encrypted backups, restore drills, and infrastructure-as-code. Do not run schema-destructive migrations in the same step as application rollout.
+```text
+apps/
+  web/                  # Next.js web client and admin area
+  mobile/               # React Native client
+services/
+  api/                  # NestJS modular monolith API and worker entrypoints
+packages/
+  types/                # Shared generated/API/domain types
+  ui/                   # Shared UI primitives where practical
+  config/               # Shared configuration and tooling
+database/
+  migrations/           # Versioned migrations after architecture approval
+  seeds/                # Non-PII development/test seeds
+tests/
+  unit/
+  integration/
+  api/
+  e2e/
+infrastructure/        # Docker, CI, deployment, and environment definitions
+docs/
+  01-product/
+  03-architecture/
+  04-database/
+  05-api/
+```
 
-## 24. Data-flow overview
+Within `services/api`, each module owns `presentation`, `application`, `domain`, and `infrastructure` areas. Shared packages cannot bypass module ownership. Exact file scaffolding is implementation work and is not created here.
 
-### Publishing a post
+## 29. Development environments
 
-1. Client authenticates and sends a validated command with an idempotency key.
-2. Content module checks account, community, visibility, and moderation eligibility.
-3. PostgreSQL transaction stores the post and an outbox event.
-4. API returns the canonical post state.
-5. Worker publishes the event, updates feed projections, search projections, notifications, and moderation checks.
-6. Clients receive updates through normal polling, refresh, or approved realtime channels.
+- **Local:** Docker Compose for PostgreSQL, Redis, and safe provider substitutes; no production secrets.
+- **CI:** Isolated test database and disposable dependencies; run unit, integration, API, security, migration, and contract checks.
+- **Staging:** Production-like configuration, non-PII seed data, provider sandboxes, realistic media limits, and observability.
+- **Production:** Private network placement, managed PostgreSQL/Redis/storage, CDN/WAF, encrypted backups, point-in-time recovery, and separate API/worker scaling.
 
-### Sending a message
+Environment configuration is injected through managed secrets or secure CI variables. `.env` files, credentials, tokens, and private certificates are never committed.
 
-1. Client submits a command; Messaging checks membership, blocks, sanctions, and idempotency.
-2. PostgreSQL stores the message and outbox event.
-3. Worker or gateway delivers to connected recipients and creates notification jobs as allowed.
-4. Offline recipients retrieve messages by cursor; delivery/read receipts update independently.
+## 30. Dependency map
 
-### Uploading media
-
-1. API authorizes and reserves an asset.
-2. Client uploads directly to private object storage.
-3. Completion triggers validation and processing jobs.
-4. Only approved variants become readable through CDN URLs.
-
-## 25. Dependency map
-
-| Dependency | Used by | Failure behavior |
+| Dependency | Consumers | Failure behavior |
 |---|---|---|
-| PostgreSQL | All durable modules | API writes fail closed; reads may degrade only for explicitly safe cached data |
-| Redis | Cache, rate limits, queues, presence | Rate limits use conservative fallback; durable commands remain in PostgreSQL/outbox |
-| Object storage/CDN | Media | Existing content remains referenced; new uploads pause or retry |
-| Email/SMS provider | Verification and alerts | Queue and retry; do not block unrelated requests |
-| APNs/FCM | Mobile push | Queue/retry; in-app notifications remain available |
-| Content-safety provider | Optional moderation signal | Mark pending or route to human review; never silently approve high-risk content |
-| CI/container registry | Delivery | Existing release remains running; block unverified deployment |
+| PostgreSQL | All durable modules | Durable writes fail closed; only explicitly safe reads may use cache |
+| Redis | Cache, queues, rate limits, presence | Durable state remains safe; degraded behavior follows fallback policy |
+| Object storage/CDN | Media/content | Existing media remains referenced; new uploads pause or retry |
+| Email/SMS provider | Verification and recovery | Queue/retry; unrelated authenticated activity continues |
+| Push provider | Notifications/mobile | In-app notifications remain; delivery failure is recorded |
+| Media/safety providers | Media and moderation | Asset remains pending or goes to human review; never silently approved |
+| Sentry/OpenTelemetry | All runtimes | Traffic continues; observability degradation alerts |
+| GitHub Actions/registry | Delivery | Existing release remains; unverified releases are blocked |
 
-## 26. Technical risks and mitigations
+## 31. Technical risks
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| No approved stack is recorded | Implementation churn | Confirm choices in `CLAUDE.md`/ADR before coding |
-| PRD and discovery inputs are unavailable | Wrong scope and data model | Restore/approve product documents before schema freeze |
-| Feed fan-out hotspots | High write volume and stale feeds | Hybrid push/pull, bounded fan-out, queue backpressure, measured ranking |
-| Messaging abuse or spam | User harm and provider cost | Rate limits, blocks, reporting, moderation, delivery controls |
-| Cross-border privacy obligations | Regulatory exposure | Data inventory, retention policy, residency/legal review |
-| Media storage and bandwidth cost | Unpredictable operating cost | Direct uploads, variants, quotas, CDN, lifecycle policies |
-| Redis used as truth | Data loss/inconsistency | PostgreSQL authority and outbox pattern |
-| Modular monolith coupling | Difficult future scaling | Enforce module ownership, contracts, and dependency rules |
-| External provider outage | Broken verification/notifications | Adapter boundaries, retries, fallback channels, status monitoring |
-| Admin privilege misuse | Severe security impact | MFA, least privilege, scoped actions, immutable audit trail |
+| Undefined launch policies and targets | Rework in authorization, schemas, operations | Resolve open PRD decisions before implementation freeze |
+| Feed fan-out hotspots | Queue pressure and stale feeds | Bounded hybrid push/pull, deterministic ranking, backpressure |
+| Messaging abuse and growth | User harm, privacy risk, storage cost | Relationship gates, blocks, reports, limits, retention, cursors |
+| Media cost or unsafe files | High cost or compromise | Private direct upload, validation, scanning, variants, quotas |
+| Cross-module coupling | Slow delivery and inconsistent policy | Contract ownership and dependency tests |
+| Provider outage | Verification, delivery, or processing failure | Adapters, retries, fallback states, health monitoring |
+| Admin privilege misuse | Severe privacy/safety impact | MFA, least privilege, re-authentication, immutable audit |
+| Database growth | Performance and recovery degradation | Query budgets, indexes, backups, restore drills, measured partitioning |
 
-## 27. Scaling considerations
+## 32. Scalability considerations
 
-Scale in this order, based on measurements:
+Scale according to measured demand:
 
-1. Add indexes, query budgets, pagination, and connection-pool tuning.
+1. Establish query budgets, indexes, cursor pagination, pool limits, and slow-query monitoring.
 2. Scale stateless API and worker replicas independently.
-3. Move read-heavy public data to safe caches and replicas.
-4. Partition high-volume tables such as messages, audit events, and feed entries when justified.
-5. Separate worker queues by workload and priority.
-6. Introduce a search engine only when PostgreSQL search latency or relevance is insufficient.
-7. Extract a module into a service only when it has a distinct scaling profile, reliability boundary, ownership team, or deployment cadence that the monolith cannot satisfy.
+3. Add safe caches and read replicas after consistency requirements are understood.
+4. Separate high-volume queues and apply backpressure.
+5. Partition proven hot tables such as messages, audit events, notifications, or feed entries after migration rehearsal.
+6. Replace PostgreSQL search only when language, relevance, or latency evidence justifies it.
+7. Extract a module only when distinct scaling, reliability, ownership, or deployment needs cannot be met within the monolith.
 
-Potential first extraction candidates are media processing or messaging delivery, not identity or authorization. Extraction requires an ADR, contract tests, event ownership, data migration plan, and operational ownership.
+Potential future extraction candidates are media processing or messaging delivery, not identity or authorization. Extraction requires an ADR, contract tests, event ownership, data migration, operational ownership, and rollback planning.
 
-## 28. Open decisions before implementation
+## 33. Future expansion considerations
 
-1. What is the approved frontend, mobile, backend, database, cloud, and deployment stack?
-2. What product scope and acceptance criteria belong in the MVP PRD?
-3. Are phone numbers, email, or both required for identity, and which African countries must be supported first?
-4. What are the initial languages, currencies, locales, and data-residency constraints?
-5. What content types, privacy modes, community modes, and messaging capabilities are in MVP?
-6. What moderation policy, appeal process, legal retention, and safety escalation rules apply?
-7. Which external providers are approved for OTP, email, push, media processing, and content safety?
-8. What traffic, storage, availability, recovery-time, and recovery-point targets should define capacity planning?
+Future expansion is not MVP implementation. After measured MVP validation and explicit approval, the architecture may accommodate deeper creator/business experiences, advanced discovery, additional content formats, monetization, commerce, jobs, financial services, live experiences, or broader integrations.
 
-## 29. Recommended next steps
+Any future capability requires product approval and architecture review. It must not compromise MVP privacy, moderation, authorization, or source-of-truth boundaries. Marketplace, payments, jobs, advanced creator monetization, and live streaming remain outside MVP.
 
-1. Restore or approve `docs/01-product/PRD.md` and create/approve `docs/01-product/project-discovery.md`.
-2. Record the technology baseline in `CLAUDE.md` or a numbered ADR.
-3. Approve MVP boundaries, privacy/moderation policies, and initial countries/languages.
-4. Produce the database schema and API contract from the approved MVP.
-5. Create ADRs for authentication, feed strategy, media provider, and deployment environment.
-6. Only then scaffold the modular monolith and implement vertical slices with tests.
+## 34. Definition of Done
+
+This architecture specification is complete for review when:
+
+- All MVP capabilities have an owning module, client surface, authorization boundary, and asynchronous behavior identified.
+- The approved stack and modular-monolith constraint are preserved.
+- PostgreSQL is authoritative and Redis is derived/ephemeral.
+- REST/OpenAPI, JWT/refresh authentication, WebSockets, media storage, jobs, and client recovery are defined.
+- Friendships, follows, blocks, Discover, country discovery, communities, privacy, moderation, admin, media, and analytics have explicit boundaries.
+- Security, RBAC, audit, deletion, retention, accessibility, low-bandwidth, and observability concerns are represented.
+- Dependency failure behavior, deployment environments, backups, restore expectations, and scaling paths are documented.
+- No migrations, API implementation, or application source code is included.
+- Product requirements are not removed or silently redefined.
+- Architecture owners approve this document before database and API implementation proceeds.
+
+## Assumptions
+
+- The technology stack in `CLAUDE.md` is approved and unchanged.
+- The MVP scope in the PRD is approved, while launch market, policy, numeric performance, and detailed behavior decisions remain open.
+- Web and mobile clients use one versioned backend contract.
+- PostgreSQL full-text search is sufficient initially unless target-language testing disproves it.
+- User-generated content, messaging, communities, and media require safety controls from first public release.
+- Initial deployment is centralized or regional; multi-region operation and residency model are not selected.
+
+## Decisions
+
+- Use a NestJS modular monolith with separate API and worker runtimes.
+- Use PostgreSQL as the sole MVP durable source of truth.
+- Use Redis only for derived/ephemeral state, queues, rate limits, cache, and presence/typing.
+- Use versioned REST/OpenAPI for durable commands and queries, with WebSockets limited to delivery.
+- Use a transactional outbox and idempotent background jobs.
+- Use direct private object-storage uploads with validated, processed, approved variants.
+- Use PostgreSQL relationships for the social graph and PostgreSQL full-text search initially.
+- Use deterministic, explainable hybrid feed generation instead of opaque personalization.
+- Keep community roles scoped and separate from platform RBAC.
+
+## Dependencies
+
+- Product decisions for launch countries, languages, age, identity, visibility, friendship/follow semantics, messaging, communities, moderation, retention, and success thresholds.
+- Approved cloud region and providers for verification, notifications, media, safety, storage, CDN, backups, and monitoring.
+- Moderation and support operations with defined authority and service levels.
+- GitHub Actions, container registry, infrastructure-as-code, backup, restore, incident response, and security testing.
+
+## Risks
+
+Primary risks are undefined launch policies, feed fan-out, messaging abuse, media cost and safety, cross-module coupling, provider failure, admin misuse, and database growth. Mitigations are defined in sections 31 and 32 and must be converted into implementation tests and operational runbooks after approval.
+
+## Open questions
+
+1. Which countries, languages, regions, diaspora segments, and age groups launch first?
+2. Which identity and verification methods are required?
+3. How exactly do friends differ from follows for visibility, messaging, and notifications?
+4. What are feed and Discover cold-start, ranking, and freshness rules?
+5. Are small-group messaging, media attachments, push, email, and SMS in the first release?
+6. What are the community role matrix, moderation taxonomy, sanctions, appeals, and legal escalation rules?
+7. What are the privacy, consent, deletion, export, retention, residency, and cross-border transfer requirements?
+8. What cloud region, vendors, traffic assumptions, SLOs, RPO, and RTO apply?
+
+## Approval gate
+
+This specification intentionally stops before database implementation. The next step is architecture review and approval. Database schema, migrations, OpenAPI details, and API implementation must not begin until this architecture and the blocking product decisions above are approved.
