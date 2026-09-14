@@ -1,11 +1,11 @@
 # AfriLink PostgreSQL Database Design
 
-**Status:** Draft — derived from the current architecture draft
-**Date:** 2026-09-13
+**Status:** Logical design complete for all modules below (identity, social/reference, content, feed, community, messaging, notification, media, moderation, admin/audit, search, integration). Every design decision this document depends on is now resolved via ADR-001, ADR-002, and ADR-003 (`docs/10-decisions/decisions.md`) — identifier format, lifecycle conventions, feed/search persistence, message retention, reaction cardinality and taxonomy, and reference-data seed content. Two items remain intentionally open as product content, not architecture: business-identity tables (deferred, not required for Phase 1) and any country/interest/reaction list content beyond the approved starter seed. **No executable schema exists yet** — `database/migrations/` and `database/seeds/` are present but empty, and no `schema.prisma` file exists anywhere in this repository. Phase 1 (identity, social, content, integration) in §25 is the recommended *first* implementation slice; it has not been started.
+**Date:** 2026-09-13 (patched 2026-09-14 to add `social.friendships` and `content.shares`, approved MVP scope per `architecture.md` §7/§12 and ADR-002 §4 missing from the original draft; patched 2026-09-14 to add `reference.countries`/`reference.interests` and correct status claims that previously and incorrectly stated Phase 1 was implemented; patched 2026-09-14 on ADR-003 approval to resolve message retention, reaction cardinality, and reference-data seed content; patched 2026-09-14 on ADR-003 §8 approval to resolve the reaction type taxonomy)
 **Database:** PostgreSQL
-**ORM/migrations assumption:** Prisma with versioned migrations
+**ORM/migrations:** Prisma (planned), versioned migrations to be created under `database/migrations/` once implementation begins
 
-> PostgreSQL, Prisma, Redis, and the modular-monolith constraint are defined in `CLAUDE.md`. `docs/01-product/PRD.md` remains empty, so product scope and retention policy still require approval. No application code or executable migration is included.
+> PostgreSQL, Prisma, Redis, and the modular-monolith constraint are defined in `CLAUDE.md`. Product scope (`docs/01-product/PRD.md`) and architecture (`docs/03-architecture/architecture.md`, ADR-001, ADR-002) are approved. Everything in this document is logical/physical design only — no application code, ORM models, or runnable migrations exist in the repository yet.
 
 ## 1. Database goals
 
@@ -20,6 +20,14 @@ The database must provide:
 
 PostgreSQL is the source of truth. Redis, object storage, search projections, and feed caches are derived or ephemeral and must be rebuildable.
 
+### Non-goals
+
+- No tables for marketplace, payments, jobs listings, creator monetization, or live streaming — out of MVP scope per `CLAUDE.md` and `docs/01-product/PRD.md`; none are modeled anywhere in this document.
+- No microservice-per-schema split, no second system of record, and no graph database — the modular monolith uses one PostgreSQL database with ownership-separated schemas (`architecture.md` §1/§8).
+- No dedicated search platform (Elasticsearch/OpenSearch) — PostgreSQL full-text search is the MVP baseline (ADR-003 §4).
+- No business/organization identity tables for MVP — individual accounts only (§24 risk table).
+- No premature partitioning, sharding, or read replicas — §21 defines the trigger conditions rather than building for hypothetical scale now.
+
 ## 2. Logical database layout
 
 Use one PostgreSQL database initially. Organize tables into PostgreSQL schemas by module ownership:
@@ -27,8 +35,9 @@ Use one PostgreSQL database initially. Organize tables into PostgreSQL schemas b
 | Schema | Responsibility |
 |---|---|
 | `identity` | Users, credentials, sessions, verification, roles, account state |
-| `social` | Profiles, follows, blocks, user preferences |
-| `content` | Posts, comments, reactions, visibility, content references |
+| `reference` | Controlled reference data: countries, interests, and other shared lookup values |
+| `social` | Profiles, follows, friendships, blocks, user preferences, user-interest selections |
+| `content` | Posts, comments, reactions, shares, visibility, content references |
 | `feed` | Materialized feed entries and ranking metadata |
 | `community` | Communities, memberships, roles, invitations |
 | `messaging` | Conversations, participants, messages, receipts |
@@ -137,14 +146,37 @@ Never model a community moderator as a global administrator. Unique constraints 
 
 ## 5. Social schema
 
+Countries and Interests are explicit MVP core modules (`CLAUDE.md`; PRD §14/§15; `architecture.md` §19 "Countries & Interests own supported reference data and user selections") but had no dedicated tables in earlier drafts of this document — profile country was a bare text field. The `reference.*` tables below close that gap; they live in their own schema (see §2) because they are shared, module-agnostic lookup data rather than social-graph data, but are documented alongside `social.profiles` since that is their primary consumer.
+
+### `reference.countries`
+
+- `code` primary key — ISO 3166-1 alpha-2, stored uppercase;
+- `name`, `name_local` (optional), `region` (continent/sub-region grouping for Discover), `is_active`, `sort_order`;
+- `created_at`, `updated_at`.
+
+Countries are additive reference rows, not a schema or code change, consistent with ADR-002's Nigeria-first-but-not-Nigeria-only launch posture. Approved starter seed content (Nigeria plus six other African countries) is defined in ADR-003 §7 (`docs/10-decisions/decisions.md`) — editable later as plain row content, no migration required.
+
+### `reference.interests`
+
+- `id`, `slug` (unique, stable, used by clients), `label`, `category` (optional grouping), `is_active`, `sort_order`;
+- `created_at`, `updated_at`.
+
+The table shape is fixed here; the approved 18-item starter taxonomy is defined in ADR-003 §7 (`docs/10-decisions/decisions.md`) as placeholder content, expected to change based on real usage without any schema change.
+
 ### `social.profiles`
 
 - `user_id` primary key and foreign key to `identity.users`;
-- `display_name`, `bio`, `avatar_media_id`, `country_code`, `region`, `website_url`;
+- `display_name`, `bio`, `avatar_media_id`, `country_code` (foreign key to `reference.countries.code`, nullable until onboarding), `region`, `website_url`;
 - `visibility`, `language_preferences`, `profile_metadata`;
 - `created_at`, `updated_at`, `deleted_at`.
 
-Do not use free-form profile metadata for authorization or moderation decisions. Country and language code formats must be selected and validated before implementation.
+Do not use free-form profile metadata for authorization or moderation decisions. Country is a foreign key into `reference.countries`, not a free-text or hardcoded value, so it stays consistent and queryable for Discover's country-relevance ranking (`architecture.md` §19). Language code format must still be selected and validated before implementation.
+
+### `social.user_interests`
+
+- `user_id` (foreign key to `identity.users`), `interest_id` (foreign key to `reference.interests`), `created_at`;
+- composite primary key `(user_id, interest_id)` — a user cannot select the same interest twice by construction;
+- index `(interest_id, user_id)` to support interest-based Discover queries ("find users who share this interest").
 
 ### `social.follows`
 
@@ -154,6 +186,17 @@ Do not use free-form profile metadata for authorization or moderation decisions.
 - check preventing self-follow unless explicitly approved by product policy.
 
 Use soft deletion or a relationship state if historical follow events are needed. Counts are derived and repairable, not authoritative.
+
+### `social.friendships`
+
+Friendship is a distinct, mutual relationship from following (architecture.md §12, ADR-002 §4): a request requires acceptance, and the relationship is private by default.
+
+- `id`, `requester_id`, `addressee_id`, `status` (`pending`, `accepted`, `declined`, `removed`), `requested_at`, `responded_at`, `created_at`, `updated_at`;
+- check preventing a self-request (`requester_id <> addressee_id`);
+- unique active relationship per unordered pair regardless of who initiated — enforce on `(least(requester_id, addressee_id), greatest(requester_id, addressee_id))` where `status` is `pending` or `accepted`, since a plain column-order unique constraint would allow both `(A,B)` and `(B,A)` to coexist;
+- indexes `(requester_id, status, created_at)` and `(addressee_id, status, created_at)` for request-list queries in both directions.
+
+Friend-list visibility defaults to private and is controlled by the account owner's privacy settings (`social.user_preferences`), independent of the follow graph's default-public visibility.
 
 ### `social.blocks`
 
@@ -172,10 +215,10 @@ Stores privacy defaults, discovery settings, locale preferences, accessibility s
 
 ### `content.posts`
 
-- `id`, `author_id`, optional `community_id`, `body`, `status`, `visibility`, `language_code`;
+- `id`, `author_id`, optional `community_id`, `body`, `status` (`published`, `hidden`, `removed`), `visibility`, `language_code`;
 - `published_at`, `edited_at`, `deleted_at`, `created_at`, `updated_at`;
 - optional `reply_to_post_id` only if threaded posts are approved;
-- moderation state must be explicit and separate from deletion status.
+- `hidden` and `removed` are moderation outcomes (architecture.md §20), `deleted_at` is the author's own deletion — moderation state must be explicit and separate from deletion status, not folded into one ambiguous flag.
 
 Indexes:
 
@@ -186,17 +229,28 @@ Indexes:
 
 ### `content.comments`
 
-- `id`, `post_id`, `author_id`, optional `parent_comment_id`, `body`, `status`, `created_at`, `updated_at`, `deleted_at`;
+- `id`, `post_id`, `author_id`, optional `parent_comment_id`, `body`, `status` (`published`, `hidden`, `removed`), `created_at`, `updated_at`, `deleted_at`;
 - indexes `(post_id, created_at, id)` and `(parent_comment_id, created_at, id)`;
 - foreign keys must prevent orphan comments unless a deliberate tombstone policy is implemented.
 
-### `content.reactions`
+### `content.post_reactions` and `content.comment_reactions`
 
-- `user_id`, `post_id` or a polymorphic target design; prefer separate target tables when referential integrity is important;
-- `reaction_type`, `created_at`, `deleted_at`;
-- unique active `(user_id, post_id, reaction_type)` or `(user_id, post_id)` if only one reaction is allowed.
+Separate target tables per content type (rather than one `content.reactions` table with a polymorphic target), so referential integrity to `posts`/`comments` stays a real foreign key.
 
-For an MVP supporting posts and comments, separate `post_reactions` and `comment_reactions` tables are preferable to an unconstrained polymorphic foreign key.
+- `user_id`, `post_id` (or `comment_id`), `reaction_type`, `created_at`, `deleted_at`;
+- unique active **`(user_id, post_id)`** / **`(user_id, comment_id)`** — one active reaction per user per post/comment (ADR-003 §6, `docs/10-decisions/decisions.md`). Selecting a new reaction type updates or replaces the existing row; it does not insert a second one.
+
+`reaction_type` is constrained to the approved five-value set (ADR-003 §8): **Like, Love, Laugh, Support, Insightful**. Store it as a short application-level enum or a small `reference.reaction_types` lookup table (implementation's choice, not an architecture question); either way it is a fixed, reviewed list, not free text. The list can change later without altering the shape of `content.post_reactions`/`comment_reactions` themselves.
+
+### `content.shares`
+
+Users share eligible posts within AfriLink, preserving the original author and source context (PRD §18; architecture.md §7 Content module).
+
+- `id`, `user_id`, `post_id`, optional `comment` (user commentary on the share), `created_at`, `deleted_at`;
+- indexes `(user_id, created_at desc, id desc)` and `(post_id, created_at desc, id desc)`;
+- a share references the original post by ID only — it does not copy content, so visibility/block/deletion/moderation checks are re-evaluated against the source post at read time, not frozen at share time.
+
+External sharing, quote-post-style resharing commentary beyond a single optional comment field, and resharing-of-a-share are not modeled here pending product approval (PRD §18).
 
 ### `content.post_media` and `content.comment_media`
 
@@ -272,7 +326,7 @@ If community roles require more detail than membership roles, store scoped role 
 - index `(conversation_id, created_at, id)` for cursor reads;
 - index `(sender_id, created_at)` for abuse and audit workflows.
 
-Messages are append-oriented. Edits and deletions must preserve the minimum audit state required by policy without retaining unnecessary content.
+Messages are append-oriented. `deleted_at` hides a message from participants immediately; the row (or an anonymized tombstone) is purged **90 days** after deletion, matching the general content-retention window under ADR-001 — messages get no bespoke retention tier (ADR-003 §5, `docs/10-decisions/decisions.md`). Moderation evidence captured before deletion follows the separate moderation/audit retention rule in ADR-001, independent of this window.
 
 ### `messaging.message_receipts`
 
@@ -407,13 +461,19 @@ Write the business mutation and outbox row in the same transaction. Consumers mu
 ```mermaid
 erDiagram
 	USERS ||--o| PROFILES : has
+	COUNTRIES ||--o{ PROFILES : "located in"
+	USERS ||--o{ USER_INTERESTS : selects
+	INTERESTS ||--o{ USER_INTERESTS : "selected via"
 	USERS ||--o{ CREDENTIALS : authenticates
 	USERS ||--o{ SESSIONS : opens
 	USERS ||--o{ FOLLOWS : creates
+	USERS ||--o{ FRIENDSHIPS : requests
 	USERS ||--o{ BLOCKS : creates
 	USERS ||--o{ POSTS : authors
 	POSTS ||--o{ COMMENTS : contains
 	POSTS ||--o{ REACTIONS : receives
+	POSTS ||--o{ SHARES : "shared as"
+	USERS ||--o{ SHARES : shares
 	USERS ||--o{ COMMUNITIES : owns
 	COMMUNITIES ||--o{ MEMBERSHIPS : has
 	USERS ||--o{ MEMBERSHIPS : joins
@@ -463,8 +523,8 @@ This is a logical overview, not an executable complete schema. Module-owned tabl
 Define retention periods with legal and product owners before production:
 
 - Account deletion marks user-facing records unavailable, revokes sessions, removes discoverability, and queues data erasure/anonymization.
-- Content deletion hides content immediately while retaining only the minimum evidence required for moderation, legal hold, or abuse prevention.
-- Messages require an explicit retention policy; deletion behavior must distinguish user-visible deletion from required safety evidence.
+- Content deletion hides content immediately while retaining only the minimum evidence required for moderation, legal hold, or abuse prevention; the underlying row is purged/anonymized 90 days after deletion (ADR-001).
+- Messages follow the same 90-day post-deletion window as content generally (ADR-003 §5) — no separate messaging-specific retention tier. Deletion behavior still distinguishes user-visible deletion (immediate) from required safety evidence (retained separately per moderation/audit rules).
 - Audit events and moderation decisions follow a separate restricted retention schedule.
 - Media objects and variants are deleted asynchronously after all references are removed or anonymized.
 - Backups follow their own expiry and restoration privacy controls.
@@ -503,24 +563,25 @@ Partitioning requires migration rehearsals, compatible indexes, retention automa
 
 ## 24. Database risks and decisions required
 
-| Risk/decision | Why it matters | Required decision |
+| Risk/decision | Why it matters | Status |
 |---|---|---|
-| Identifier format | Affects every foreign key and cursor | Select UUIDv7, ULID, or equivalent |
-| Initial countries/languages | Affects locale, search, and profile fields | Confirm supported codes and search configurations |
-| Product scope | Determines tables and relationships | Approve MVP PRD before schema freeze |
-| Privacy/legal retention | Determines deletion and audit behavior | Obtain policy/legal approval |
-| Message retention | High sensitivity and storage growth | Define deletion, export, and evidence rules |
-| Business identities | May require organization tables and permissions | Validate before adding marketplace complexity |
-| Search implementation | Affects projections and indexes | Validate PostgreSQL FTS with target languages |
-| Scale targets | Determines partitioning and replicas | Approve traffic, RPO, RTO, and SLO assumptions |
+| Identifier format | Affects every foreign key and cursor | **Resolved:** UUIDv7 (ADR-003 §1, `docs/10-decisions/decisions.md`). Earlier drafts of this document cited this as "Resolved... per ADR-002" — incorrect, ADR-002 (`docs/03-architecture/approval-gate.md`) does not address identifiers; corrected 2026-09-14, now correctly resolved via ADR-003 |
+| Initial countries/languages | Affects locale, search, and profile fields | **Resolved for MVP:** Nigeria + 6 other African countries seeded, English-only (no `reference.languages` table needed for one language) — ADR-003 §7. Expanding the country list or adding a second language later is a content/seed change, not a schema change |
+| Product scope | Determines tables and relationships | **Resolved:** PRD approved (`docs/01-product/PRD.md`) |
+| Privacy/legal retention | Determines deletion and audit behavior | **Resolved:** ADR-001 (`docs/10-decisions/decisions.md`) — 30/90-day windows |
+| Reaction cardinality and taxonomy | Affects `post_reactions`/`comment_reactions` uniqueness and allowed values | **Resolved:** one active reaction per user per post/comment (ADR-003 §6) — unique `(user_id, post_id)` / `(user_id, comment_id)`; five allowed types — Like, Love, Laugh, Support, Insightful (ADR-003 §8) |
+| Message retention | High sensitivity and storage growth | **Resolved:** 90 days post-deletion, same window as general content under ADR-001 — no bespoke messaging tier (ADR-003 §5) |
+| Business identities | May require organization tables and permissions | Open — not required for the Phase 1 implementation slice |
+| Search strategy | Affects projections and indexes | **Resolved:** PostgreSQL full-text search first (ADR-003 §4); revisit only if language/relevance/latency evidence justifies a dedicated search engine |
+| Scale targets | Determines partitioning and replicas | **Partially resolved:** 99.5% availability, p95<500ms, ~10k/1k capacity targets approved (ADR-002); RPO/RTO and vendor/region deferred to infrastructure phase |
 
 ## 25. Recommended implementation order after approval
 
-1. Confirm PRD, identity policy, countries/languages, retention, and identifier format.
-2. Create the initial Prisma/PostgreSQL migration for identity, social, content, and integration foundations.
-3. Add communities, messaging, notifications, media, moderation, audit, feed, and search projections incrementally.
+1. ~~Confirm PRD, identity policy, countries/languages, retention, and identifier format.~~ Resolved: PRD, ADR-001, ADR-002, ADR-003.
+2. Create the initial Prisma/PostgreSQL migration for identity, reference, social, content, and integration foundations.
+3. Add communities, messaging, notifications, media, moderation, audit, feed, and search projections incrementally. Messaging requires no further retention decision (ADR-003 §5) before it can be implemented.
 4. Add constraints and authorization-focused integration tests before feature breadth.
-5. Add representative seed data and query-performance fixtures.
+5. Seed `reference.countries` and `reference.interests` with the ADR-003 §7 starter content, plus other representative seed data and query-performance fixtures.
 6. Validate backup/restore, migration rollback/forward-fix, outbox replay, deletion workflows, and privacy checks.
 
-No executable migration should be generated until the product scope and retention policies are approved.
+This document's design is now fully approved (PRD, ADR-001, ADR-002, ADR-003). Step 2 onward — actual Prisma schema and migrations — is implementation work outside this document's scope and has not been started in this repository.
