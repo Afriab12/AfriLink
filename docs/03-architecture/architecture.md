@@ -10,6 +10,8 @@ This document defines the technical architecture for the approved MVP in `docs/0
 
 AfriLink uses one modular-monolith backend codebase with separate API and worker runtimes. Web and mobile clients consume the same versioned REST/OpenAPI contract. WebSockets provide selected realtime delivery, but PostgreSQL remains authoritative for durable state.
 
+**Launch scope (ADR-002, `docs/03-architecture/approval-gate.md`):** Primary launch country is Nigeria with an 18+ audience and English as the primary interface language. Country, language, and age scope are product/content parameters, not architectural constraints — reference data (countries, languages, interests) and localization are designed to extend to additional African countries, languages, and age-appropriate policy changes without structural redesign. No minor/teen account system is built for MVP.
+
 The system consists of:
 
 - Next.js + TypeScript web client.
@@ -155,7 +157,7 @@ flowchart LR
 | Search | Search projections and indexing state | Consumes eligible public changes |
 | Moderation | Reports, cases, decisions, sanctions, appeals | `ContentActioned` |
 | Admin & Audit | Admin workflows, feature flags, audit records | Security and moderation audit events |
-| Privacy | Visibility, consent, retention, deletion policy interfaces | Enforced by owning use cases |
+| Privacy | Visibility, consent, retention, deletion, export policy interfaces (ADR-001) | Enforced by owning use cases |
 
 Every cross-module event is versioned, typed, idempotently consumed, and tested.
 
@@ -170,7 +172,7 @@ PostgreSQL is the only durable relational source of truth for the MVP. Use one d
 - Commit authoritative mutations and outbox records atomically.
 - Keep feeds, counters, notifications, projections, and caches rebuildable.
 - Store timestamps consistently and preserve country, language, locale, and timezone preferences.
-- Apply explicit lifecycle, deletion, evidence, retention, and legal-hold policy.
+- Apply explicit lifecycle, deletion, evidence, retention, and legal-hold policy per ADR-001 (`docs/10-decisions/decisions.md`): deleted-account personal data scheduled for deletion/irreversible anonymization within 30 days (subject to legal/security/fraud/regulatory holds); deleted content retained up to 90 days for moderation, abuse investigation, and recovery before deletion/anonymization; moderation/audit/security records retained as necessary for safety, appeals, and legal obligations; deletion procedures account for backup copies and backup expiration.
 - Use Prisma as the ORM/migration direction recorded in the existing architecture decisions, but do not create migrations in this task.
 
 ## 9. REST API architecture overview
@@ -190,6 +192,9 @@ Resource areas include `/auth`, `/users`, `/profiles`, `/friends`, `/follows`, `
 
 ## 10. Authentication architecture
 
+- Registration identifiers are email or phone number plus password (ADR-001, `docs/10-decisions/decisions.md`); no government-ID/KYC verification in MVP.
+- Account activation requires verification (email or phone challenge) before full access.
+- Users identify themselves by username/display name/profile name; no universal real-name enforcement.
 - Use short-lived JWT access tokens and rotating refresh tokens.
 - Store refresh-token representations as hashes and support device/session revocation.
 - Hash passwords with a memory-hard algorithm such as Argon2id; never log credentials or tokens.
@@ -197,6 +202,8 @@ Resource areas include `/auth`, `/users`, `/profiles`, `/friends`, `/follows`, `
 - Use secure HttpOnly/SameSite cookies where web policy selects cookies and OS-protected storage for mobile refresh credentials.
 - Require MFA and recent re-authentication for sensitive administrator actions.
 - Audit login, verification, recovery, credential changes, session revocation, role changes, and administrative actions.
+- Identity/account-type verification badges (Person, Creator, Business, Organization) are a future enhancement, not MVP scope.
+- Registration enforces an 18+ minimum age declaration (ADR-002); MVP does not build a minor/teen account model, parental controls, or age-tiered experience. Age-assurance strength beyond self-declaration is a future/legal consideration.
 
 ## 11. Authorization/RBAC
 
@@ -206,17 +213,28 @@ Platform roles are separate from community roles. Platform RBAC is least privile
 
 ## 12. Social graph architecture
 
-Friendships, follows, and blocks are separate relationship types.
+Friendships, follows, and blocks are separate relationship types (ADR-002).
 
-- Friendships support request, accept, decline, remove, and policy-controlled visibility.
-- Follows are directed and independently managed.
+**Friendships:**
+
+- Mutual relationship requiring a request and an acceptance; declined/removed requests return to no relationship.
+- Friend relationship existence is private by default (visible only to the two participants and, where permitted, mutuals).
+- Users control whether their friend list is visible to others, subject to the same default-private posture.
+
+**Follows:**
+
+- One-way, directed relationship; no acceptance step required.
+- Public by default (visible on profiles and to search) unless the followed account restricts followability or follower-list visibility.
+- Intended to support creator/public-profile discovery distinct from the private friendship graph.
+
+**Common rules:**
+
 - Blocks suppress discovery, feeds, messaging, notifications, and interaction according to policy.
 - Relationship mutations are transactional and idempotent.
 - Derived counts are repairable from authoritative relationships.
+- Visibility rules for friendship existence, friend-list visibility, and follow/follower-list visibility are enforced consistently everywhere a relationship could leak: profile views, feed composition, search results, notifications, and messaging eligibility checks.
 - Authorization checks relationship, visibility, account state, blocks, and moderation before reads or writes.
 - Use PostgreSQL relationships and indexes; do not add a graph database for MVP.
-
-The product must still finalize exact friend/follow visibility and messaging semantics.
 
 ## 13. Feed architecture
 
@@ -229,17 +247,20 @@ Use a deterministic, explainable hybrid feed:
 5. Results use cursor pagination.
 6. Deletions, hides, blocks, sanctions, and privacy changes trigger invalidation or rebuild work.
 
-Initial signals may include recency, relationship strength, community membership, country/language relevance, and basic engagement. Opaque personalization is excluded from MVP. Freshness, cold-start behavior, and ranking weights remain open decisions.
+Ranking signals for MVP are relationship, relevance, recency, and basic engagement (ADR-002) — a deterministic, explainable scoring function, not a complex AI/ML recommendation system. The ranking function is implemented behind a single application-service interface so a more advanced recommender can be introduced later without changing feed generation, storage, or client contracts. Exact signal weighting, freshness decay, and cold-start behavior are tunable implementation parameters, not architectural blockers.
 
 ## 14. Messaging architecture
 
+**MVP scope (ADR-002):** one-to-one conversations only; text messages and image attachments; message requests (an initial message from a non-connection is held as a request until accepted); read status; block/report integration. Small-group conversations, voice calls, video calls, voice notes, and live streaming are explicitly out of MVP scope — the conversation/participant model below does not preclude group conversations later, but no group-specific UX or fan-out is built now.
+
 - Conversations and membership are relational and owned by Messaging.
+- Message requests are a conversation/message state (pending vs. accepted), not a separate data model, so accepting a request is a state transition rather than a migration.
 - REST creates messages; WebSockets deliver accepted events to authorized connected participants.
 - PostgreSQL is authoritative; clients recover missed messages through cursors after reconnect.
 - Message sends use client idempotency keys.
 - Delivery/read state is separate from message acceptance.
 - Presence and typing are short-lived Redis signals, never durable facts.
-- Attachments reference approved Media assets.
+- Attachments reference approved Media assets (image attachments only for MVP).
 - Conversation creation, participants, sends, and delivery enforce relationship, privacy, block, membership, sanction, reporting, and retention rules.
 
 ## 15. Notification architecture
@@ -255,6 +276,8 @@ Notifications are created asynchronously from domain events.
 
 ## 16. Media/file architecture
 
+**MVP scope (ADR-002):** profile images, post images, and limited video uploads, with basic image/video validation and processing. Voice notes, live streaming, advanced short-video/reels infrastructure, and advanced video editing are explicitly out of MVP scope — the pipeline below is intentionally generic so those formats can be added later as new asset purposes/variants rather than a new pipeline.
+
 1. The API authorizes owner, purpose, type, size, and quota and creates a pending asset.
 2. The client uploads directly to private S3-compatible storage using short-lived signed instructions.
 3. Completion queues validation and processing.
@@ -262,7 +285,7 @@ Notifications are created asynchronously from domain events.
 5. Only ready and policy-approved variants become referenceable or deliverable.
 6. Deletion and orphan cleanup follow reference and retention policy.
 
-Never trust filenames or client MIME declarations. Exact limits, video duration, safety provider, processing targets, and retention periods remain open decisions.
+Never trust filenames or client MIME declarations. Exact numeric limits (file size, video duration/bitrate ceilings), safety-scanning provider, and processing-time targets are implementation/infrastructure parameters deferred alongside vendor selection (§13/ADR-002) — they do not change this pipeline's shape.
 
 ## 17. Community architecture
 
@@ -294,21 +317,25 @@ Countries and Interests own supported reference data and user selections. Discov
 - Country discovery supports cross-border exploration and does not imply identity or country verification unless explicitly approved.
 - Results respect language, privacy, blocks, account state, and moderation.
 - Country and region data is reference-controlled rather than free-form authorization data.
+- Country reference data launches with Nigeria as the primary market but is not hard-coded to it — additional countries are added as reference rows, not schema or code changes (ADR-002).
 
-Initial countries, region granularity, language support, verification, and ranking signals remain open decisions.
+**Discover ranking (ADR-002):** MVP Discover prioritizes country, interests, social relationships, activity, recency, and community relevance through the same deterministic, explainable scoring approach as the feed — no machine-learning ranking for MVP. Region granularity below country level and exact signal weighting remain tunable implementation parameters.
 
 ## 20. Moderation architecture
 
-Moderation is a first-class workflow for profiles, posts, comments, shares, messages, and communities.
+Moderation is a first-class workflow for profiles, posts, comments, shares, messages, and communities. MVP uses **post-moderation** (ADR-001): content publishes after basic automated checks, with enforcement handled through reporting, queues, and human review rather than pre-publish blocking.
 
 - Reports create categorized cases with deduplication, priority, assignment, status, evidence access, and response tracking.
-- Automated signals may assist triage but do not silently make consequential decisions.
-- Actions are scoped, policy-driven, time-bounded where appropriate, and auditable.
-- User-facing status and appeals exist where approved policy requires them.
-- Evidence is minimized, access-controlled, and retained separately from ordinary user-visible deletion.
+- Automated filtering assists triage but does not silently make consequential decisions.
+- Moderators may remove content, restrict content, warn users, suspend accounts, ban accounts, and restrict community participation. Actions are scoped, policy-driven, time-bounded where appropriate, and auditable.
+- Users may report content, users, and communities; block users; and appeal eligible moderation decisions.
+- Initial report taxonomy (ADR-002): Spam, Harassment, Hate, Impersonation, Scam/fraud, Violence, Sexual content, Misinformation, Other.
+- Appeal target: 72 hours for normal appeals, with critical safety/security cases prioritized faster (ADR-002). This is an operational target for queue design and alerting, not a guaranteed legal SLA — the case model tracks category, priority, and age so the target is measurable and enforceable operationally.
+- Evidence is minimized, access-controlled, and retained separately from ordinary user-visible deletion, consistent with the moderation/audit retention rule in ADR-001.
 - Blocks, sanctions, and actions apply consistently to discovery, feed, messaging, notifications, and communities.
+- Advanced/AI-assisted moderation beyond basic automated filtering is a future enhancement, not MVP scope.
 
-Moderation taxonomy, sanctions, appeals, legal escalation, staffing, and service levels require product and legal approval.
+Sanction durations (exact suspension/ban length tiers), the community role/permission matrix beyond owner and moderator, and the legal escalation path are policy/operational parameters layered on top of this model — they do not require architectural changes and are deferred to moderation-policy and legal review rather than architecture approval.
 
 ## 21. Admin architecture
 
@@ -359,6 +386,8 @@ Defense in depth includes TLS, secure headers, strict CORS, WAF controls, CSRF p
 
 Incident response covers credential revocation, evidence preservation, moderation escalation, and user communication. Secrets, tokens, passwords, private user information, and unnecessary PII must not appear in source control, logs, notifications, analytics, errors, or public URLs.
 
+Per ADR-001, the platform is privacy-by-design: collect only data necessary for defined features, never sell personal data, protect private messages/contact information/precise location as protected data, and provide user-facing data-export and account/data-deletion mechanisms enforced through the same API authorization layer as other resource access. Production data residency is not restricted to a single country; cloud region selection weighs latency, reliability, security, data-protection requirements, cost, and cross-border transfer requirements, and any cross-border transfer must be reviewed against applicable law before production use. Compliance design targets the Nigeria Data Protection Act 2023 and applicable NDPC requirements; GDPR applicability is assessed separately per actual processing activity rather than claimed by default.
+
 ## 26. Observability and monitoring
 
 Use Sentry for application errors and OpenTelemetry for traces and metrics.
@@ -367,7 +396,8 @@ Use Sentry for application errors and OpenTelemetry for traces and metrics.
 - Trace API, database, Redis, queues, storage, and external providers.
 - Monitor latency/error rates, database pool/locks, cache hit rate, queue lag, job failures, feed freshness, upload failures, authentication abuse, message delivery, notification delivery, moderation response, and provider health.
 - Alert on availability, saturation, data freshness, security anomalies, failed jobs, and recovery health.
-- Define numeric SLOs after launch traffic, capacity, RPO, and RTO decisions are approved.
+- **MVP SLOs (ADR-002):** 99.5% availability for core production services; p95 API latency below 500ms for normal requests under expected MVP load. These are initial planning targets to design and alert against, not confirmed guarantees — they must be validated by load testing before being treated as commitments.
+- RPO/RTO numeric targets remain deferred to the deployment/infrastructure phase alongside vendor selection (§13/ADR-002).
 
 ## 27. Deployment architecture
 
@@ -396,6 +426,8 @@ flowchart LR
 - Use health/readiness probes, graceful shutdown, rolling or blue/green releases, and rollback/forward-fix procedures.
 - Use encrypted backups, point-in-time recovery, restore drills, and private database/network placement.
 - Never couple destructive schema changes to the first application release that requires them.
+
+**Vendor neutrality (ADR-002):** the architecture stays vendor-neutral where practical — managed PostgreSQL, managed Redis, and S3-compatible object storage are specified by capability, not by a named provider, and the application must not be hard-coded to a specific cloud. Specific infrastructure vendors (cloud provider, database hosting, object storage, CDN, messaging/queue infrastructure) are selected during the deployment/infrastructure phase, evaluated on cost, African-region availability, reliability, security, data protection, and each service's availability in-region. This selection is deferred deliberately and does not block architecture approval.
 
 ## 28. Repository/folder architecture
 
@@ -453,7 +485,7 @@ Environment configuration is injected through managed secrets or secure CI varia
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Undefined launch policies and targets | Rework in authorization, schemas, operations | Resolve open PRD decisions before implementation freeze |
+| Undefined detailed policy (community role matrix, sanction durations, legal escalation path) and numeric success/activation thresholds | Rework in authorization, schemas, operations if resolved late | Launch market, core policy, and reliability/performance targets are resolved (ADR-001, ADR-002); resolve remaining policy/threshold detail before implementation freeze |
 | Feed fan-out hotspots | Queue pressure and stale feeds | Bounded hybrid push/pull, deterministic ranking, backpressure |
 | Messaging abuse and growth | User harm, privacy risk, storage cost | Relationship gates, blocks, reports, limits, retention, cursors |
 | Media cost or unsafe files | High cost or compromise | Private direct upload, validation, scanning, variants, quotas |
@@ -463,6 +495,8 @@ Environment configuration is injected through managed secrets or secure CI varia
 | Database growth | Performance and recovery degradation | Query budgets, indexes, backups, restore drills, measured partitioning |
 
 ## 32. Scalability considerations
+
+**Initial capacity target (ADR-002):** design the MVP to support approximately 10,000 registered users and 1,000 concurrent users without a fundamental architectural rewrite. This is a planning target for sizing connection pools, queue concurrency, and instance counts — not a statement that the target is met until load-tested.
 
 Scale according to measured demand:
 
@@ -500,7 +534,7 @@ This architecture specification is complete for review when:
 ## Assumptions
 
 - The technology stack in `CLAUDE.md` is approved and unchanged.
-- The MVP scope in the PRD is approved, while launch market, policy, numeric performance, and detailed behavior decisions remain open.
+- The MVP scope in the PRD is approved. Launch market/language/age, core privacy/moderation/retention/identity/residency policy, and numeric reliability/performance/capacity targets are resolved (ADR-001, ADR-002). Detailed behavior decisions (e.g., community role matrix, sanction durations, legal escalation path, numeric activation/retention success thresholds) remain open but do not block this architecture.
 - Web and mobile clients use one versioned backend contract.
 - PostgreSQL full-text search is sufficient initially unless target-language testing disproves it.
 - User-generated content, messaging, communities, and media require safety controls from first public release.
@@ -517,29 +551,37 @@ This architecture specification is complete for review when:
 - Use PostgreSQL relationships for the social graph and PostgreSQL full-text search initially.
 - Use deterministic, explainable hybrid feed generation instead of opaque personalization.
 - Keep community roles scoped and separate from platform RBAC.
+- Adopt ADR-001 (`docs/10-decisions/decisions.md`): privacy-by-design with user export/deletion rights, post-moderation model, 30/90-day account/content deletion retention windows, email/phone/password identity with no KYC, and region selection without a Nigeria-only residency mandate.
+- Adopt ADR-002 (`docs/03-architecture/approval-gate.md`): Nigeria-primary/English-primary/18+ launch scope with multi-country/localization-ready architecture; mutual/private-by-default friendships vs. one-way/public-by-default follows; deterministic (non-ML) feed and Discover ranking behind a pluggable ranking interface; one-to-one text+image messaging with message requests; profile/post images plus limited video for MVP media; expanded moderation report taxonomy and a 72-hour appeal operational target; 99.5% availability and p95<500ms SLO targets; ~10k-user/1k-concurrent capacity target; vendor-neutral infrastructure with vendor selection deferred to the deployment phase.
 
 ## Dependencies
 
-- Product decisions for launch countries, languages, age, identity, visibility, friendship/follow semantics, messaging, communities, moderation, retention, and success thresholds.
-- Approved cloud region and providers for verification, notifications, media, safety, storage, CDN, backups, and monitoring.
+- Remaining policy-level detail: community role/permission matrix beyond owner/moderator, sanction duration tiers, legal escalation path, and the push/email/SMS launch-channel decision. None of these require architecture changes. (Launch country/language/age, friend/follow semantics, feed/Discover ranking model, messaging/media scope, report taxonomy, appeal SLA target, and SLO/capacity targets are resolved by ADR-002; identity, privacy/retention/residency, and moderation model are resolved by ADR-001.)
+- Approved cloud region and providers for verification, notifications, media, safety, storage, CDN, backups, and monitoring — deliberately deferred to the deployment/infrastructure phase per ADR-002 vendor-neutrality decision, not a blocker to architecture approval.
 - Moderation and support operations with defined authority and service levels.
 - GitHub Actions, container registry, infrastructure-as-code, backup, restore, incident response, and security testing.
 
 ## Risks
 
-Primary risks are undefined launch policies, feed fan-out, messaging abuse, media cost and safety, cross-module coupling, provider failure, admin misuse, and database growth. Mitigations are defined in sections 31 and 32 and must be converted into implementation tests and operational runbooks after approval.
+Primary risks are undefined detailed policy/threshold decisions (community role matrix, sanction durations, legal escalation path, numeric success thresholds — launch market, core policy, and reliability/performance targets are already resolved per ADR-001/ADR-002), feed fan-out, messaging abuse, media cost and safety, cross-module coupling, provider failure, admin misuse, and database growth. Mitigations are defined in sections 31 and 32 and must be converted into implementation tests and operational runbooks after approval.
 
 ## Open questions
 
-1. Which countries, languages, regions, diaspora segments, and age groups launch first?
-2. Which identity and verification methods are required?
-3. How exactly do friends differ from follows for visibility, messaging, and notifications?
-4. What are feed and Discover cold-start, ranking, and freshness rules?
-5. Are small-group messaging, media attachments, push, email, and SMS in the first release?
-6. What are the community role matrix, moderation taxonomy, sanctions, appeals, and legal escalation rules?
-7. What are the privacy, consent, deletion, export, retention, residency, and cross-border transfer requirements?
-8. What cloud region, vendors, traffic assumptions, SLOs, RPO, and RTO apply?
+1. ~~Which countries, languages, regions, diaspora segments, and age groups launch first?~~ Resolved by ADR-002: Nigeria primary launch country, English primary language, 18+ only, architecture must support expansion. Secondary-country sequencing, diaspora-targeting priority, and additional launch languages remain future product decisions but do not block architecture approval.
+2. ~~Which identity and verification methods are required?~~ Resolved by ADR-001: email/phone + password, verification-gated activation, no KYC.
+3. ~~How exactly do friends differ from follows for visibility, messaging, and notifications?~~ Resolved by ADR-002: mutual, request/accept, default-private friendships vs. one-way, default-public follows; see §12.
+4. ~~What are feed and Discover cold-start, ranking, and freshness rules?~~ Resolved at a model level by ADR-002 (deterministic relationship/relevance/recency/engagement signals; no ML). Exact weighting, decay curves, and cold-start heuristics are tunable implementation parameters, not architecture blockers.
+5. ~~Are small-group messaging, media attachments, push, email, and SMS in the first release?~~ Messaging/media scope resolved by ADR-002: one-to-one only, text + image attachments, message requests, read status; profile/post images and limited video. Whether push/email/SMS notification channels ship at MVP launch (vs. in-app only) remains an open, low-risk product/vendor decision — the notification architecture already treats each channel as an optional adapter, so this does not block architecture approval.
+6. What are the exact community role matrix (beyond owner/moderator), sanction durations, and legal escalation rules? (Report taxonomy and appeal SLA target resolved by ADR-002; see §20.) These are policy parameters layered on the existing moderation model, not structural changes.
+7. ~~What are the privacy, consent, deletion, export, retention, residency, and cross-border transfer requirements?~~ Resolved by ADR-001 (see `docs/10-decisions/decisions.md`), unchanged by ADR-002.
+8. ~~What cloud region, vendors, traffic assumptions, SLOs, RPO, and RTO apply?~~ SLOs resolved by ADR-002 (99.5% availability, p95 < 500ms, ~10k users/1k concurrent capacity target). Vendor/region selection and numeric RPO/RTO are deliberately deferred to the deployment/infrastructure phase (§13/ADR-002), not withheld for lack of a decision.
 
 ## Approval gate
 
 This specification intentionally stops before database implementation. The next step is architecture review and approval. Database schema, migrations, OpenAPI details, and API implementation must not begin until this architecture and the blocking product decisions above are approved.
+
+**Update (2026-09-14):** ADR-001 (`docs/10-decisions/decisions.md`) resolves the privacy, moderation model, data retention, identity/verification, and data-residency decisions referenced throughout this document.
+
+**Update (2026-09-14, ADR-002):** `docs/03-architecture/approval-gate.md` resolves launch country/language/age scope, friend/follow semantics, feed and Discover ranking model, messaging and media MVP scope, moderation report taxonomy and appeal SLA target, reliability/performance/capacity targets, and the vendor-neutrality decision. The only remaining items — community role matrix detail, sanction duration tiers, legal escalation path, the push/email/SMS launch-channel choice, and specific vendor/region selection — are policy or infrastructure-selection parameters that fit within the architecture as already defined and do not require further architecture changes to proceed.
+
+**ARCHITECTURE STATUS: READY FOR OWNER APPROVAL**

@@ -1,6 +1,6 @@
 # AfriLink Product Requirements Document
 
-**Status:** Approved MVP scope - launch parameters and policy decisions remain open  
+**Status:** Approved MVP scope - architecture approved (ADR-001, ADR-002); launch market/language/age, friend/follow, feed/Discover ranking, messaging/media scope, moderation taxonomy/appeal target, and reliability/performance/capacity targets are resolved; remaining open items are secondary policy/UX detail, not architecture blockers  
 **Date:** 2026-09-13  
 **Product:** AFRILINK  
 **Tagline:** Africa's Social Network, Built for Africans.
@@ -32,7 +32,7 @@ The MVP is intended for:
 - **Moderators and administrators:** People responsible for community safety, platform moderation, support, and operations.
 - **Unauthenticated visitors:** People who may view permitted public content and decide whether to register.
 
-The initial launch country, countries, diaspora segments, age range, languages, and primary target segment remain open decisions.
+Primary launch country is Nigeria, primary interface language is English, and the MVP audience is 18+ only (ADR-002, `docs/03-architecture/approval-gate.md`); the product must remain ready to expand to additional African countries and languages. Diaspora-targeting priority, secondary-country sequencing, and primary target segment (individual vs. creator vs. business emphasis) remain open decisions.
 
 ## 5. User personas
 
@@ -83,7 +83,7 @@ Success measures must be finalized for the selected launch market before launch.
 - **Reliability:** sign-in success, feed availability, message delivery, notification delivery, media upload success, crash-free sessions, and service availability.
 - **Experience:** user-reported trust, relevance of discovery, usability, accessibility, and low-bandwidth experience.
 
-Specific numeric targets, measurement definitions, baseline period, and launch thresholds are open questions and must be approved before implementation is considered complete.
+Reliability and API performance now have approved targets — 99.5% availability for core production services and p95 API latency below 500ms under expected MVP load (ADR-002) — validated by load testing rather than assumed met. Activation/retention/engagement/discovery/safety numeric targets, measurement definitions, baseline period, and launch thresholds remain open and must be approved before implementation is considered complete.
 
 ## 8. MVP scope
 
@@ -117,7 +117,7 @@ AfriLink must:
 - Support a first-run flow for display identity, country or region, language preferences, privacy defaults, and relevant discovery choices.
 - Avoid exposing whether a private account or credential exists when that would enable enumeration.
 
-The approved identity methods, required fields, supported countries, age policy, and verification channels remain open decisions.
+Identity method (email or phone plus password, verification-gated activation, no KYC — ADR-001) and age policy (18+ only, no minor/teen account system — ADR-002) are approved. Exact required-field set and verification-channel implementation detail (e.g., email vs. phone as primary) remain open, non-blocking decisions.
 
 ## 11. Authentication
 
@@ -149,16 +149,16 @@ Users must be able to view profiles only to the extent permitted by account stat
 
 ## 13. Friend/follow system
 
-AfriLink must support both friendship and following as distinct relationship concepts, subject to final product semantics:
+AfriLink supports both friendship and following as distinct relationship concepts (ADR-002):
 
-- Users can send, accept, decline, remove, and view permitted friend relationships.
-- Users can follow and unfollow other users.
+- **Friends** are a mutual relationship: a friend request requires acceptance, and the friendship (and, by default, the friend list itself) is private — visible only as the account owner's privacy settings allow. Users can send, accept, decline, remove, and view permitted friend relationships.
+- **Following** is a one-way relationship intended to support creators and public profiles: users can follow and unfollow other users, and following/follower visibility is public by default unless the followed account restricts it.
 - Users can see their relationship state with another user when permitted.
 - Relationship actions must respect privacy, blocks, account restrictions, and moderation.
 - Users must not be able to bypass a block or privacy setting through followers, friends, search, feed, notifications, or messaging.
 - Relationship changes should produce appropriate notifications according to preferences.
 
-The exact distinction between friends and followers, including whether friendship is mutual and how each affects visibility and messaging, must be finalized before implementation.
+Visibility rules for friendship existence, friend-list visibility, and follow/follower-list visibility apply consistently across profiles, feed, search, and notifications.
 
 ## 14. Home feed
 
@@ -171,7 +171,7 @@ The home feed must:
 - Provide enough relevance to help a new user find value without relying on opaque personalization.
 - Support user controls such as hiding or reporting content where approved.
 
-The initial ranking model, feed freshness target, and cold-start behavior require product approval.
+The initial ranking model is approved (ADR-002): relationship, relevance, recency, and basic engagement signals — deterministic and explainable, not a complex AI recommendation system, with the architecture able to accommodate a more advanced recommender later without redesign. Exact freshness decay and cold-start behavior for new users remain open, non-blocking tuning decisions.
 
 ## 15. Posts
 
@@ -186,7 +186,7 @@ Users must be able to:
 - View engagement associated with posts where permitted.
 - Report posts they believe violate policy.
 
-Posts must pass applicable account, visibility, media, community, and moderation rules. The MVP does not include unapproved additional post formats.
+Posts must pass applicable account, visibility, media, community, and moderation rules. The MVP does not include unapproved additional post formats. Video posts are subject to the approved MVP media scope: limited video uploads with basic validation and processing (§31); advanced video editing is out of scope.
 
 ## 16. Reactions
 
@@ -225,17 +225,16 @@ External sharing, quote-post behavior, and resharing commentary are not defined 
 
 ## 19. Messaging
 
-AfriLink must support safe direct messaging, including:
+MVP messaging is one-to-one only (ADR-002); small-group conversations are out of MVP scope. AfriLink must support:
 
 - One-to-one conversations.
-- Approved small-group conversations if included in the launch scope.
-- Sending and receiving text messages.
-- Message history and delivery/read state appropriate to the product policy.
-- Approved media attachments where media requirements permit them.
+- Sending and receiving text messages, with image attachments.
+- Message requests: a first message from a non-connection is held as a request until the recipient accepts, governing who may initiate a conversation.
+- Message history and read status.
 - Blocking, reporting, muting, and leaving conversations where applicable.
 - Recovery after intermittent connectivity and clear send failure states.
 
-Messaging must enforce relationship, privacy, membership, account, moderation, and block rules. Message retention, group size, attachment types, read receipts, and who may initiate conversations require final policy decisions.
+Voice calls, video calls, and voice notes are out of MVP scope (ADR-002; see PRD §9). Messaging must enforce relationship, privacy, membership, account, moderation, and block rules. Exact message retention duration beyond the account/conversation lifecycle rule (ADR-001) remains open, non-blocking policy detail.
 
 ## 20. Notifications
 
@@ -265,7 +264,7 @@ Search must:
 - Provide useful empty and no-access states without revealing private records.
 - Apply safe limits and abuse controls.
 
-Search ranking, supported languages, filters, and whether private or follower-only content is searchable require approval.
+English is the approved primary interface/search language for MVP (ADR-002), with the architecture able to support additional languages later. Search ranking, additional-language support, filters, and whether private or follower-only content is searchable remain open, non-blocking decisions.
 
 ## 22. Discover
 
@@ -273,7 +272,7 @@ Discover must help users find relevant people, communities, and content beyond t
 
 Discover must be transparent enough for users to understand why content or accounts are shown, respect privacy and safety controls, and avoid opaque personalization in the MVP.
 
-The exact discover surfaces, ranking signals, and onboarding recommendations require validation.
+Discover ranking signals are approved (ADR-002): country, interests, social relationships, activity, recency, and community relevance — no machine-learning ranking for MVP. The exact discover surfaces and onboarding recommendations remain open, non-blocking decisions.
 
 ## 23. Country-based discovery
 
@@ -285,7 +284,7 @@ AfriLink must make country-based discovery a first-class MVP capability:
 - Country information must not expose sensitive location data or imply verification unless the product explicitly supports it.
 - Country-based results must respect language, privacy, blocks, moderation, and account status.
 
-The initial country list, region granularity, country verification policy, and supported languages are open decisions.
+Nigeria is the primary launch country and English the primary language (ADR-002), with country reference data designed to expand to additional African countries without redesign. Region granularity below country level and country verification policy remain open, non-blocking decisions.
 
 ## 24. Communities
 
@@ -323,7 +322,7 @@ Users must be able to report eligible:
 
 Reports must provide a clear reason category, optional supporting context where approved, confirmation that the report was received, and appropriate status visibility. Reporting must avoid exposing reporter identity or sensitive case details unnecessarily.
 
-The report taxonomy, anonymous-report policy, duplicate handling, and user feedback commitments require approval.
+The initial report taxonomy is approved (ADR-002): Spam, Harassment, Hate, Impersonation, Scam/fraud, Violence, Sexual content, Misinformation, Other. Anonymous-report policy, duplicate handling, and user feedback commitments remain open, non-blocking decisions.
 
 ## 27. Blocking
 
@@ -349,7 +348,7 @@ AfriLink must provide basic platform and community moderation for the first publ
 - Appeals where policy requires them.
 - Auditability of decisions, actors, reasons, scope, and duration.
 
-Automated checks may assist triage, but consequential enforcement must follow the approved moderation policy. The policy, service levels, sanctions, appeals, and legal escalation path are open decisions.
+Automated checks may assist triage, but consequential enforcement must follow the approved moderation policy (post-moderation — ADR-001). The appeal response target is 72 hours for normal appeals, with critical safety/security cases prioritized faster, treated as an operational target rather than a guaranteed legal deadline (ADR-002). Sanction durations, detailed service levels, and the legal escalation path remain open decisions.
 
 ## 29. Admin dashboard
 
@@ -379,11 +378,11 @@ Users must be able to manage:
 - Session or device access where supported.
 - Account deletion or deactivation request.
 
-Privacy controls must be understandable, apply consistently across the product, and default to appropriate protection for new users. Data export, consent management, and legal rights workflows require product and legal definition.
+Privacy controls must be understandable, apply consistently across the product, and default to appropriate protection for new users. Data export and account/data deletion are approved product commitments (ADR-001); the exact export/deletion workflow implementation and broader consent-management/legal-rights workflows require further legal and product definition.
 
 ## 31. Media requirements
 
-The MVP must support photo and video posts and approved media in other MVP contexts. Media must:
+Approved MVP media scope (ADR-002): profile images, post images, and limited video uploads, with basic image/video validation and processing. Voice notes, live streaming, advanced short-video/reels infrastructure, and advanced video editing are out of MVP scope (see PRD §9). Media must:
 
 - Be uploaded only by an authorized user for an approved purpose.
 - Support allowed file types, sizes, dimensions, duration, and quotas.
@@ -393,7 +392,7 @@ The MVP must support photo and video posts and approved media in other MVP conte
 - Support deletion and cleanup according to content and retention policy.
 - Preserve appropriate attribution and accessibility information such as alternative text where supported.
 
-Exact file limits, video duration, processing targets, media safety checks, and storage retention require approval.
+Exact file limits, video duration ceilings, processing targets, and media safety-check provider are implementation/infrastructure detail deferred alongside vendor selection (ADR-002) — non-blocking to product scope. Storage retention follows the deleted-content retention rule in ADR-001 (up to 90 days before deletion/anonymization).
 
 ## 32. Performance requirements
 
@@ -406,7 +405,7 @@ AfriLink must provide a responsive experience for supported devices and variable
 - Predictable message and notification delivery behavior.
 - Monitoring of latency, error rate, upload success, queue delay, and availability.
 
-Numeric API latency, feed freshness, message delivery, upload completion, availability, device support, bandwidth budgets, and recovery targets are not yet approved and must be defined before launch.
+Approved targets (ADR-002): 99.5% availability for core production services; p95 API latency below 500ms under expected MVP load; initial capacity target of approximately 10,000 registered users and 1,000 concurrent users. These are planning targets to be confirmed by load testing, not guarantees. Feed freshness, message delivery, upload completion, device support, bandwidth budgets, and recovery (RPO/RTO) targets remain open — RPO/RTO are deferred to the deployment/infrastructure phase alongside vendor selection and are not product blockers.
 
 ## 33. Accessibility
 
@@ -449,7 +448,7 @@ AfriLink must:
 - Document country and cross-border data handling before launch.
 - Provide consent and user-rights workflows required by the launch markets.
 
-Retention periods, data residency, legal basis, export, correction, and deletion guarantees remain open decisions.
+Retention periods (30 days for deleted-account data, 90 days for deleted content, both subject to legal/security/fraud holds), data residency (no Nigeria-only mandate; region selected on latency/reliability/security/cost/legal grounds), export, and deletion guarantees are approved by ADR-001 (`docs/10-decisions/decisions.md`). Legal basis and correction-workflow detail, and jurisdiction-specific compliance beyond the Nigeria Data Protection Act 2023 baseline, remain open and require legal definition.
 
 ## 36. Analytics
 
@@ -573,14 +572,50 @@ Future expansion may be considered after MVP validation and explicit approval. C
 
 These are possibilities, not commitments. Expansion must follow evidence from user needs, safety outcomes, operating capacity, and the approved product strategy. Marketplace, payments, jobs, advanced creator monetization, and live streaming remain explicitly out of scope for the MVP.
 
-## Open product decisions
+## Resolved product decisions
 
-The following decisions must be resolved before requirements are treated as implementation-ready:
+`docs/10-decisions/decisions.md` (ADR-001, approved) resolves:
 
-- Initial launch country or countries, target segment, diaspora scope, and launch sequence.
-- Supported languages, age policy, accessibility target, and identity/verification methods.
-- Exact friend/follow semantics, visibility modes, messaging permissions, and community model.
-- Feed and Discover ranking, cold-start behavior, reaction set, sharing behavior, and content limits.
-- Moderation taxonomy, sanctions, appeals, legal escalation, response targets, and evidence retention.
-- Privacy, consent, deletion, export, retention, residency, and cross-border data policies.
-- Numeric success targets, performance thresholds, reliability objectives, capacity assumptions, and launch criteria.
+- **Identity/verification methods:** Email, phone, and password registration; account activation requires verification; no KYC or government-ID verification in MVP; username/display name, no real-name enforcement.
+- **Privacy, consent, deletion, export, retention, residency, and cross-border data policies:** Privacy-by-design; user data export and account/data deletion supported; deleted-account data scheduled for deletion/anonymization within 30 days, deleted content within 90 days; no Nigeria-only residency mandate, region selected on latency/reliability/security/cost/legal grounds; designed toward the Nigeria Data Protection Act 2023, GDPR applicability assessed separately.
+- **Moderation model:** Post-moderation with automated filtering, user reporting, moderation queues, human review, account enforcement, and appeals.
+
+`docs/03-architecture/approval-gate.md` (ADR-002, approved 2026-09-14) additionally resolves:
+
+- **Launch market:** Nigeria primary, architecture expansion-ready for additional African countries.
+- **Launch language:** English primary, architecture localization-ready.
+- **Age scope:** 18+ only; no minor/teen account system in MVP.
+- **Friend/follow semantics:** Friends mutual, request/accept, private by default (with user control over friend-list visibility); follows one-way, public by default, supporting creators/public profiles. Applied consistently across profiles, feed, search, and notifications.
+- **Feed ranking:** Relationship, relevance, recency, and basic engagement signals — deterministic, not a complex AI recommendation system; architecture allows a more advanced recommender later.
+- **Discover ranking:** Country, interests, social relationships, activity, recency, and community relevance — no machine-learning ranking for MVP.
+- **Messaging scope:** One-to-one only; text and image attachments; message requests; read status; block/report integration. Small-group messaging, voice/video calls, and voice notes are out of MVP.
+- **Media scope:** Profile images, post images, and limited video uploads with basic validation/processing. Live streaming, reels-style infrastructure, and advanced video editing are out of MVP.
+- **Moderation taxonomy:** Spam, Harassment, Hate, Impersonation, Scam/fraud, Violence, Sexual content, Misinformation, Other.
+- **Moderation appeal target:** 72 hours for normal appeals (operational target, not a legal guarantee); critical safety/security cases prioritized faster.
+- **Reliability, performance, and capacity targets:** 99.5% availability for core production services; p95 API latency below 500ms under expected MVP load; initial design target of ~10,000 registered users / ~1,000 concurrent users. Planning targets pending load-test validation.
+- **Vendor posture:** Architecture stays vendor-neutral; specific cloud/database/storage/CDN/messaging vendors are deferred to the deployment/infrastructure phase (a technical/infrastructure decision, not a product blocker).
+
+## Remaining open product decisions
+
+The following require further product (and in some cases legal) definition. None of them block architecture approval or contradict an approved decision above — they are refinements within the approved scope:
+
+- Diaspora-targeting priority, secondary-country sequencing, and primary target segment (individual vs. creator vs. business emphasis).
+- Additional supported languages beyond English, and the target accessibility standard/testing threshold.
+- Reaction set (single vs. multiple reaction types), comment threading/mentions/limits, and external-sharing/quote-post behavior.
+- Feed/Discover freshness decay and cold-start behavior tuning; Discover surfaces and onboarding recommendations.
+- Community role matrix detail beyond owner/moderator, approval workflow, and maximum community size.
+- Search ranking, additional search-language support, filters, and follower-only/private-content searchability.
+- Anonymous-report policy, duplicate-report handling, user feedback commitments, sanction duration tiers, detailed service levels, and the legal escalation path.
+- Push/email/SMS notification channel launch decision (in-app notifications are already in scope; other channels are optional adapters).
+- Admin roles, operational metrics, and support workflows.
+- Activation/retention/engagement/discovery/safety numeric success targets, measurement definitions, and baseline period.
+- Analytics event taxonomy and tooling.
+
+## Deferred technical/infrastructure decisions (not product blockers)
+
+These are intentionally deferred to implementation or infrastructure planning and do not require further product approval to proceed with architecture-consistent implementation:
+
+- Specific cloud provider/region and vendor selection for database hosting, object storage, CDN, and messaging infrastructure.
+- Numeric RPO/RTO targets.
+- Exact media file-size/duration limits, safety-scanning provider, and processing-time targets.
+- Message retention duration beyond the account/conversation lifecycle rule already set by ADR-001.
