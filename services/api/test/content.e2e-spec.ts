@@ -547,6 +547,106 @@ describe('Content (e2e)', () => {
   });
 
   // ============================================================
+  // Moderation state (existing content.posts/content.comments `status`
+  // field — ContentStatus: published/hidden/removed)
+  // ============================================================
+  // No moderation-action endpoints exist yet (out of scope for the
+  // Content API) — these tests seed `status` directly via Prisma to
+  // confirm the existing filtering in PostAccessService/posts.service.ts/
+  // comments.service.ts actually holds, since nothing previously
+  // exercised it. Note: this filtering doesn't special-case the owner —
+  // a hidden/removed post or comment disappears for its own author too,
+  // since no moderation actions exist yet to expose it differently.
+
+  describe('Moderation state filtering', () => {
+    it('a hidden post is not retrievable by ID and is excluded from the author\'s own listing', async () => {
+      const author = await registerUser();
+      const post = await createPost(author);
+      await prisma.post.update({ where: { id: post.id }, data: { status: 'hidden' } });
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/posts/${post.id}`)
+        .set('Cookie', cookieHeader(author.cookies, 'afrilink_at'))
+        .expect(404);
+
+      const list = await request(app.getHttpServer())
+        .get(`/api/v1/users/${author.userId}/posts`)
+        .set('Cookie', cookieHeader(author.cookies, 'afrilink_at'))
+        .expect(200);
+      expect(list.body.data.map((p: { id: string }) => p.id)).not.toContain(post.id);
+    });
+
+    it('a removed post is not retrievable by ID and is excluded from the author\'s own listing', async () => {
+      const author = await registerUser();
+      const post = await createPost(author);
+      await prisma.post.update({ where: { id: post.id }, data: { status: 'removed' } });
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/posts/${post.id}`)
+        .set('Cookie', cookieHeader(author.cookies, 'afrilink_at'))
+        .expect(404);
+
+      const list = await request(app.getHttpServer())
+        .get(`/api/v1/users/${author.userId}/posts`)
+        .set('Cookie', cookieHeader(author.cookies, 'afrilink_at'))
+        .expect(200);
+      expect(list.body.data.map((p: { id: string }) => p.id)).not.toContain(post.id);
+    });
+
+    it('a hidden post also blocks commenting, reacting, and sharing (interaction never exceeds visibility)', async () => {
+      const author = await registerUser();
+      const other = await registerUser();
+      const post = await createPost(author);
+      await prisma.post.update({ where: { id: post.id }, data: { status: 'hidden' } });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/posts/${post.id}/comments`)
+        .set(auth(other))
+        .send({ body: 'sneaky' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .put(`/api/v1/posts/${post.id}/reaction`)
+        .set(auth(other))
+        .send({ type: 'like' })
+        .expect(404);
+      await request(app.getHttpServer()).post(`/api/v1/posts/${post.id}/shares`).set(auth(other)).send({}).expect(404);
+    });
+
+    it('a hidden top-level comment is excluded from the post\'s comment list', async () => {
+      const author = await registerUser();
+      const post = await createPost(author);
+      const comment = await request(app.getHttpServer())
+        .post(`/api/v1/posts/${post.id}/comments`)
+        .set(auth(author))
+        .send({ body: 'will be hidden' })
+        .expect(201);
+      await prisma.comment.update({ where: { id: comment.body.data.id }, data: { status: 'hidden' } });
+
+      const list = await request(app.getHttpServer()).get(`/api/v1/posts/${post.id}/comments`).expect(200);
+      expect(list.body.data.map((c: { id: string }) => c.id)).not.toContain(comment.body.data.id);
+    });
+
+    it('a removed reply is excluded from its parent comment\'s replies list', async () => {
+      const author = await registerUser();
+      const post = await createPost(author);
+      const topLevel = await request(app.getHttpServer())
+        .post(`/api/v1/posts/${post.id}/comments`)
+        .set(auth(author))
+        .send({ body: 'top level' })
+        .expect(201);
+      const reply = await request(app.getHttpServer())
+        .post(`/api/v1/posts/${post.id}/comments`)
+        .set(auth(author))
+        .send({ body: 'will be removed', parentCommentId: topLevel.body.data.id })
+        .expect(201);
+      await prisma.comment.update({ where: { id: reply.body.data.id }, data: { status: 'removed' } });
+
+      const replies = await request(app.getHttpServer()).get(`/api/v1/comments/${topLevel.body.data.id}/replies`).expect(200);
+      expect(replies.body.data.map((c: { id: string }) => c.id)).not.toContain(reply.body.data.id);
+    });
+  });
+
+  // ============================================================
   // Cross-cutting: blocks suppress all content interaction
   // ============================================================
 
