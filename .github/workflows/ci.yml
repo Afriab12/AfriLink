@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same branch/PR rather than letting them
+# queue up and finish out of order.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # --------------------------------------------------------------------
+    # EPHEMERAL CI-ONLY DATABASE — ISOLATION NOTICE
+    #
+    # This Postgres instance is a GitHub Actions *service container*:
+    # created fresh for this job only, network-reachable solely from this
+    # job's steps, and destroyed automatically when the job ends. It is
+    # NOT, and must never be treated as, local dev (afrilink_dev) or any
+    # production database:
+    #   - Credentials below (POSTGRES_PASSWORD / DATABASE_URL) are
+    #     throwaway values that exist only inside this ephemeral
+    #     container's lifetime — they are not real secrets and are not
+    #     the local dev or production DATABASE_URL.
+    #   - Only `prisma migrate deploy` is run against it (applies the
+    #     already-committed migration files exactly as-is). CI never
+    #     runs `prisma db push` or `prisma migrate reset`, and never
+    #     generates or modifies migrations.
+    #   - If the migration fails to apply, this step fails and the job
+    #     stops (no continue-on-error anywhere in this workflow).
+    # --------------------------------------------------------------------
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: afrilink
+          POSTGRES_PASSWORD: afrilink_ci_only
+          POSTGRES_DB: afrilink_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U afrilink -d afrilink_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Points at the ephemeral service container above (localhost:5432
+      # inside the job's network namespace) — never the local dev or
+      # production DATABASE_URL, neither of which is available to CI.
+      DATABASE_URL: postgresql://afrilink:afrilink_ci_only@localhost:5432/afrilink_test
+      # CI-only, throwaway — never used outside this ephemeral job.
+      JWT_ACCESS_SECRET: ci-test-secret-not-for-production-use
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            database/package-lock.json
+            services/api/package-lock.json
+
+      # Installs + generates the Prisma Client first — services/api's
+      # @prisma/client is a `file:` reference to this generated output
+      # (database/node_modules/@prisma/client), not a separate copy, so
+      # this must run before installing services/api's own dependencies.
+      - name: Install database package dependencies
+        working-directory: database
+        run: npm ci
+
+      - name: Generate Prisma Client
+        working-directory: database
+        run: npx prisma generate
+
+      # The same, unmodified migration file used locally, applied only to
+      # the ephemeral CI database service above — migrate deploy only,
+      # never db push or migrate reset. A non-zero exit here fails the job.
+      - name: Apply approved migration to ephemeral CI database
+        working-directory: database
+        run: npx prisma migrate deploy
+
+      - name: Seed reference data (ADR-003 §7)
+        working-directory: database
+        run: node --experimental-strip-types seeds/reference.seed.ts
+
+      - name: Install API dependencies
+        working-directory: services/api
+        run: npm ci
+
+      - name: Type check
+        working-directory: services/api
+        run: npm run typecheck
+
+      # Uses the project's existing, unmodified build script (nest build)
+      # — no new tooling, just verifies the app still compiles/bundles.
+      - name: Build
+        working-directory: services/api
+        run: npm run build
+
+      - name: Lint
+        working-directory: services/api
+        run: npm run lint
+
+      # services/api's test scripts read .env.test via Node's --env-file
+      # flag (matching local dev exactly) — .env.test is gitignored on
+      # purpose, so CI writes its own throwaway copy here rather than the
+      # workflow needing to know about that convention some other way.
+      - name: Write CI test environment file
+        working-directory: services/api
+        run: |
+          cat > .env.test <<EOF
+          DATABASE_URL=${{ env.DATABASE_URL }}
+          JWT_ACCESS_SECRET=${{ env.JWT_ACCESS_SECRET }}
+          NODE_ENV=test
+          PORT=3001
+          EOF
+
+      - name: Run tests
+        working-directory: services/api
+        run: npm test
