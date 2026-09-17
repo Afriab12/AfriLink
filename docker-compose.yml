@@ -1,0 +1,33 @@
+# AfriLink local development environment.
+#
+# PostgreSQL only, for local development against the Phase 1 schema in
+# database/schema.prisma. Not production infrastructure — no TLS, no
+# managed backups, no replicas; bound to localhost only (127.0.0.1), never
+# exposed on the network. See docs/09-deployment/ for production posture
+# once that phase begins.
+#
+# Usage: docker compose up -d
+# (Not started automatically — see setup notes for why.)
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: afrilink_postgres_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-afrilink_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-afrilink}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env — see .env.example}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - afrilink_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-afrilink} -d $${POSTGRES_DB:-afrilink_dev}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  afrilink_postgres_data:
+    name: afrilink_postgres_data

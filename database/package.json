@@ -1,0 +1,17 @@
+{
+  "name": "@afrilink/database",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AfriLink PostgreSQL schema, migrations, and reference-data seeds (Prisma). Phase 1 scope: identity, reference, social, content, integration.",
+  "prisma": {
+    "schema": "schema.prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "7.10.0",
+    "@prisma/adapter-pg": "7.10.0",
+    "pg": "8.23.0"
+  },
+  "devDependencies": {
+    "prisma": "7.10.0"
+  }
+}

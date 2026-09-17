@@ -1,0 +1,560 @@
+// AfriLink database schema — Phase 1
+//
+// Scope: identity, reference, social, content, integration ONLY
+// (docs/04-database/database.md §25, step 2). Communities, messaging,
+// notifications, media, moderation, audit, feed, and search are added
+// incrementally in later phases and are NOT modeled here yet.
+//
+// Design source of truth: docs/04-database/database.md
+// Approved decisions: docs/10-decisions/decisions.md (ADR-001, ADR-003),
+// docs/03-architecture/approval-gate.md (ADR-002)
+//
+// NOT YET APPLIED to any database. File created for review only —
+// no `prisma migrate` / `prisma db push` has been run against this schema.
+//
+// Deliberate Phase 1 omissions (see database.md for each):
+// - `content.posts.reply_to_post_id` — threaded posts are not an approved
+//   product decision (database.md §6: "only if threaded posts are approved").
+// - `content.post_media` / `content.comment_media` — depend on the `media`
+//   schema, which is not part of Phase 1.
+// - `content.visibility_rules` — exception-list table, not needed until a
+//   visibility exception actually arises (database.md §6).
+// - `social.profiles.avatar_media_id` and `content.posts.community_id` are
+//   modeled as plain nullable UUID columns with NO foreign key yet, because
+//   `media` and `community` schemas don't exist until a later phase. The FK
+//   is added additively when those schemas are implemented.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  // Connection URL moved to prisma7.config.ts (Prisma 7 no longer accepts
+  // `url` directly in schema.prisma — see database/prisma7.config.ts).
+  schemas    = ["identity", "reference", "social", "content", "integration"]
+  extensions = [citext]
+}
+
+// ============================================================
+// identity schema — docs/04-database/database.md §4
+// ============================================================
+
+enum UserStatus {
+  active
+  restricted
+  suspended
+  banned
+  pending_deletion
+  deleted
+
+  @@schema("identity")
+}
+
+enum AccountType {
+  individual
+  creator
+  business
+  organization
+
+  @@schema("identity")
+}
+
+model User {
+  id          String      @id @default(uuid(7)) @db.Uuid
+  handle      String?     @unique @db.Citext
+  status      UserStatus  @default(active)
+  accountType AccountType @default(individual) @map("account_type")
+  locale      String      @default("en")
+  timezone    String?
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt   DateTime?   @map("deleted_at") @db.Timestamptz
+
+  credentials            Credential[]
+  sessions               Session[]
+  verificationChallenges VerificationChallenge[]
+  userRoles              UserRole[]
+  profile                Profile?
+  userInterests          UserInterest[]
+  followsAsFollower      Follow[]          @relation("FollowerFollows")
+  followsAsFollowee      Follow[]          @relation("FolloweeFollows")
+  friendshipsRequested   Friendship[]      @relation("FriendshipRequester")
+  friendshipsReceived    Friendship[]      @relation("FriendshipAddressee")
+  blocksAsBlocker        Block[]           @relation("BlockerBlocks")
+  blocksAsBlocked        Block[]           @relation("BlockedByBlocks")
+  preferences            UserPreference?
+  posts                  Post[]
+  comments               Comment[]
+  postReactions          PostReaction[]
+  commentReactions       CommentReaction[]
+  shares                 Share[]
+
+  @@index([status, createdAt])
+  @@index([deletedAt]) // deleted-at lifecycle queries, per database.md §4
+  @@map("users")
+  @@schema("identity")
+}
+
+model Credential {
+  id                   String    @id @default(uuid(7)) @db.Uuid
+  userId               String    @map("user_id") @db.Uuid
+  kind                 String
+  identifierNormalized String    @map("identifier_normalized")
+  secretHash           String    @map("secret_hash")
+  verifiedAt           DateTime? @map("verified_at") @db.Timestamptz
+  lastUsedAt           DateTime? @map("last_used_at") @db.Timestamptz
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  revokedAt            DateTime? @map("revoked_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Uniqueness on (kind, identifier_normalized) is enforced only among
+  // ACTIVE (revoked_at IS NULL) credentials via a partial index added in
+  // the migration SQL — Prisma's @@unique cannot express a WHERE clause.
+  @@index([userId])
+  @@map("credentials")
+  @@schema("identity")
+}
+
+model Session {
+  id               String    @id @default(uuid(7)) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  refreshTokenHash String    @unique @map("refresh_token_hash")
+  deviceId         String?   @map("device_id")
+  deviceLabel      String?   @map("device_label")
+  ipHash           String?   @map("ip_hash")
+  userAgentHash    String?   @map("user_agent_hash")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  lastSeenAt       DateTime? @map("last_seen_at") @db.Timestamptz
+  expiresAt        DateTime  @map("expires_at") @db.Timestamptz
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz
+  revokeReason     String?   @map("revoke_reason")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt, expiresAt])
+  @@map("sessions")
+  @@schema("identity")
+}
+
+model VerificationChallenge {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  userId          String    @map("user_id") @db.Uuid
+  channel         String
+  destinationHash String    @map("destination_hash")
+  purpose         String
+  challengeHash   String    @map("challenge_hash")
+  attemptCount    Int       @default(0) @map("attempt_count")
+  expiresAt       DateTime  @map("expires_at") @db.Timestamptz
+  consumedAt      DateTime? @map("consumed_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([destinationHash, purpose, expiresAt])
+  @@map("verification_challenges")
+  @@schema("identity")
+}
+
+model Role {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  key         String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+
+  @@map("roles")
+  @@schema("identity")
+}
+
+model Permission {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  key         String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+  @@schema("identity")
+}
+
+model RolePermission {
+  roleId       String   @map("role_id") @db.Uuid
+  permissionId String   @map("permission_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+  @@schema("identity")
+}
+
+model UserRole {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  roleId     String    @map("role_id") @db.Uuid
+  scopeType  String?   @map("scope_type")
+  scopeId    String?   @map("scope_id") @db.Uuid
+  grantedBy  String?   @map("granted_by") @db.Uuid
+  grantedAt  DateTime  @default(now()) @map("granted_at") @db.Timestamptz
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  // Uniqueness of (user_id, role_id, scope_type, scope_id) among ACTIVE
+  // (revoked_at IS NULL) assignments is a partial index in the migration.
+  @@index([userId])
+  @@map("user_roles")
+  @@schema("identity")
+}
+
+// ============================================================
+// reference schema — docs/04-database/database.md §5
+// Seed content approved in ADR-003 §7
+// ============================================================
+
+model Country {
+  code      String   @id @db.Char(2)
+  name      String
+  nameLocal String?  @map("name_local")
+  region    String?
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  profiles Profile[]
+
+  @@map("countries")
+  @@schema("reference")
+}
+
+model Interest {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  slug      String   @unique
+  label     String
+  category  String?
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  userInterests UserInterest[]
+
+  @@map("interests")
+  @@schema("reference")
+}
+
+// ============================================================
+// social schema — docs/04-database/database.md §5
+// ============================================================
+
+enum ProfileVisibility {
+  public
+  followers
+  private
+
+  @@schema("social")
+}
+
+model Profile {
+  userId              String            @id @map("user_id") @db.Uuid
+  displayName         String?           @map("display_name")
+  bio                 String?
+  avatarMediaId       String?           @map("avatar_media_id") @db.Uuid // FK to media.assets added when `media` schema exists (later phase)
+  countryCode         String?           @map("country_code") @db.Char(2)
+  region              String?
+  websiteUrl          String?           @map("website_url")
+  visibility          ProfileVisibility @default(public)
+  primaryLanguage     String            @default("en") @map("primary_language") // English-only for MVP per ADR-003 §7; no reference.languages table yet
+  profileMetadata     Json?             @map("profile_metadata")
+  createdAt           DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime          @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt           DateTime?         @map("deleted_at") @db.Timestamptz
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  country Country? @relation(fields: [countryCode], references: [code])
+
+  @@index([countryCode])
+  @@map("profiles")
+  @@schema("social")
+}
+
+model UserInterest {
+  userId     String   @map("user_id") @db.Uuid
+  interestId String   @map("interest_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  interest Interest @relation(fields: [interestId], references: [id], onDelete: Cascade)
+
+  @@id([userId, interestId])
+  @@index([interestId, userId])
+  @@map("user_interests")
+  @@schema("social")
+}
+
+enum FollowStatus {
+  active // single value for Phase 1; deletedAt handles removal.
+         // `status` kept per database.md §5 as a placeholder for a future
+         // distinction (e.g. muted-but-following) — not a current need.
+
+  @@schema("social")
+}
+
+model Follow {
+  id         String       @id @default(uuid(7)) @db.Uuid
+  followerId String       @map("follower_id") @db.Uuid
+  followeeId String       @map("followee_id") @db.Uuid
+  status     FollowStatus @default(active)
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt  DateTime?    @map("deleted_at") @db.Timestamptz
+
+  follower User @relation("FollowerFollows", fields: [followerId], references: [id], onDelete: Cascade)
+  followee User @relation("FolloweeFollows", fields: [followeeId], references: [id], onDelete: Cascade)
+
+  // Self-follow CHECK and the partial-unique "one active pair" index are
+  // added in the migration SQL (not expressible in Prisma's schema DSL).
+  @@index([followeeId, createdAt, followerId])
+  @@index([followerId, createdAt, followeeId])
+  @@map("follows")
+  @@schema("social")
+}
+
+enum FriendshipStatus {
+  pending
+  accepted
+  declined
+  removed
+
+  @@schema("social")
+}
+
+model Friendship {
+  id           String           @id @default(uuid(7)) @db.Uuid
+  requesterId  String           @map("requester_id") @db.Uuid
+  addresseeId  String           @map("addressee_id") @db.Uuid
+  status       FriendshipStatus @default(pending)
+  requestedAt  DateTime         @default(now()) @map("requested_at") @db.Timestamptz
+  respondedAt  DateTime?        @map("responded_at") @db.Timestamptz
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  requester User @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee User @relation("FriendshipAddressee", fields: [addresseeId], references: [id], onDelete: Cascade)
+
+  // Self-request CHECK and the unordered-pair partial-unique index
+  // (least/greatest, WHERE status IN ('pending','accepted')) are added in
+  // the migration SQL — functional expression indexes aren't expressible
+  // in Prisma's schema DSL.
+  @@index([requesterId, status, createdAt])
+  @@index([addresseeId, status, createdAt])
+  @@map("friendships")
+  @@schema("social")
+}
+
+model Block {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  blockerId  String    @map("blocker_id") @db.Uuid
+  blockedId  String    @map("blocked_id") @db.Uuid
+  reasonCode String?   @map("reason_code")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz
+
+  blocker User @relation("BlockerBlocks", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("BlockedByBlocks", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  // Self-block CHECK and the partial-unique active-pair index are added
+  // in the migration SQL.
+  @@index([blockerId, deletedAt])
+  @@index([blockedId, deletedAt])
+  @@map("blocks")
+  @@schema("social")
+}
+
+model UserPreference {
+  userId               String    @id @map("user_id") @db.Uuid
+  profileVisibility    ProfileVisibility @default(public) @map("profile_visibility")
+  friendListVisible    Boolean   @default(false) @map("friend_list_visible")
+  discoverable         Boolean   @default(true) @map("discoverable")
+  quietHoursStart      String?   @map("quiet_hours_start") // "HH:MM", app-validated
+  quietHoursEnd        String?   @map("quiet_hours_end")
+  notificationDefaults Json?     @map("notification_defaults")
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+  @@schema("social")
+}
+
+// ============================================================
+// content schema — docs/04-database/database.md §6
+// ============================================================
+
+enum ContentStatus {
+  published
+  hidden
+  removed
+
+  @@schema("content")
+}
+
+model Post {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  authorId    String        @map("author_id") @db.Uuid
+  communityId String?       @map("community_id") @db.Uuid // FK to community.communities added when `community` schema exists (later phase)
+  body        String
+  status      ContentStatus @default(published)
+  visibility  String        @default("public") // public | followers | community_members | mentioned_users | private — kept as validated text, not enum, until community/mention scope exists to exercise the full set
+  languageCode String       @default("en") @map("language_code")
+  publishedAt DateTime?     @map("published_at") @db.Timestamptz
+  editedAt    DateTime?     @map("edited_at") @db.Timestamptz
+  deletedAt   DateTime?     @map("deleted_at") @db.Timestamptz
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+
+  author    User             @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments  Comment[]
+  reactions PostReaction[]
+  shares    Share[]
+
+  @@index([authorId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([communityId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, publishedAt(sort: Desc), id(sort: Desc)])
+  @@map("posts")
+  @@schema("content")
+}
+
+model Comment {
+  id              String        @id @default(uuid(7)) @db.Uuid
+  postId          String        @map("post_id") @db.Uuid
+  authorId        String        @map("author_id") @db.Uuid
+  parentCommentId String?       @map("parent_comment_id") @db.Uuid
+  body            String
+  status          ContentStatus @default(published)
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt       DateTime?     @map("deleted_at") @db.Timestamptz
+
+  post          Post              @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author        User              @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parentComment Comment?          @relation("CommentReplies", fields: [parentCommentId], references: [id], onDelete: Restrict)
+  replies       Comment[]         @relation("CommentReplies")
+  reactions     CommentReaction[]
+
+  @@index([postId, createdAt, id])
+  @@index([parentCommentId, createdAt, id])
+  @@map("comments")
+  @@schema("content")
+}
+
+enum ReactionType {
+  like
+  love
+  laugh
+  support
+  insightful // approved five-type taxonomy, ADR-003 §8
+
+  @@schema("content")
+}
+
+model PostReaction {
+  userId       String       @map("user_id") @db.Uuid
+  postId       String       @map("post_id") @db.Uuid
+  reactionType ReactionType @map("reaction_type")
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt    DateTime?    @map("deleted_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  // Plain (not partial) unique: exactly one row ever exists per
+  // (user_id, post_id) — reacting again updates reaction_type/deleted_at
+  // in place rather than inserting a second row (ADR-003 §6).
+  @@id([userId, postId])
+  @@map("post_reactions")
+  @@schema("content")
+}
+
+model CommentReaction {
+  userId       String       @map("user_id") @db.Uuid
+  commentId    String       @map("comment_id") @db.Uuid
+  reactionType ReactionType @map("reaction_type")
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt    DateTime?    @map("deleted_at") @db.Timestamptz
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@id([userId, commentId])
+  @@map("comment_reactions")
+  @@schema("content")
+}
+
+model Share {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  postId    String    @map("post_id") @db.Uuid
+  comment   String?
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([postId, createdAt(sort: Desc), id(sort: Desc)])
+  @@map("shares")
+  @@schema("content")
+}
+
+// ============================================================
+// integration schema — docs/04-database/database.md §15
+// ============================================================
+
+model OutboxEvent {
+  id            String    @id @default(uuid(7)) @db.Uuid
+  eventType     String    @map("event_type")
+  eventVersion  Int       @map("event_version")
+  aggregateType String    @map("aggregate_type")
+  aggregateId   String    @map("aggregate_id") @db.Uuid
+  payload       Json
+  occurredAt    DateTime  @default(now()) @map("occurred_at") @db.Timestamptz
+  availableAt   DateTime  @default(now()) @map("available_at") @db.Timestamptz
+  publishedAt   DateTime? @map("published_at") @db.Timestamptz
+  attemptCount  Int       @default(0) @map("attempt_count")
+  lastError     String?   @map("last_error")
+  lockedUntil   DateTime? @map("locked_until") @db.Timestamptz
+
+  @@index([publishedAt, availableAt, occurredAt])
+  @@map("outbox_events")
+  @@schema("integration")
+}
+
+model IdempotencyKey {
+  ownerId           String    @map("owner_id") @db.Uuid
+  key               String
+  commandType       String    @map("command_type")
+  requestFingerprint String   @map("request_fingerprint")
+  status            String
+  responsePayload   Json?     @map("response_payload")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  expiresAt         DateTime  @map("expires_at") @db.Timestamptz
+
+  @@id([ownerId, key, commandType])
+  @@map("idempotency_keys")
+  @@schema("integration")
+}

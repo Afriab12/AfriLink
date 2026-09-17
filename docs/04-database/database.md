@@ -309,8 +309,10 @@ If community roles require more detail than membership roles, store scoped role 
 
 ### `messaging.conversations`
 
-- `id`, `kind` (`direct`, `group`), `created_by`, `title`, `status`, `last_message_at`, `created_at`, `updated_at`, `deleted_at`;
+- `id`, `kind`, `created_by`, `title`, `status`, `last_message_at`, `created_at`, `updated_at`, `deleted_at`;
 - index `(last_message_at desc, id desc)` for user conversation lists only through participant joins.
+
+**Phase scoping:** the `kind` column exists so group conversations don't require a restructure later (`architecture.md` §14: "does not preclude group conversations later"), but its CHECK constraint is **`direct`-only for as long as messaging is implemented under MVP scope** (ADR-002 §7: one-to-one only). Nothing else in this schema — `messaging.participants`, fan-out, moderation, or notification policy — is designed for more than two participants, so allowing `group` at the database layer before that design work exists would let the system reach a state it can't safely handle. Widening the CHECK constraint to add `group` when it is actually approved is a pure additive migration, not a restructure.
 
 ### `messaging.participants`
 
