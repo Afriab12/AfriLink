@@ -1,4 +1,5 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
+import { ApiTags } from '@nestjs/swagger';
 import type { Request, Response } from 'express';
 import { AuthService, type RequestContext } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
@@ -24,13 +25,24 @@ function buildContext(req: Request): RequestContext {
   };
 }
 
+type RegisterResult = Awaited<ReturnType<AuthService['register']>>;
+type LoginResult = Awaited<ReturnType<AuthService['login']>>;
+type RequestVerificationResult = Awaited<ReturnType<AuthService['requestVerification']>>;
+type ForgotPasswordResult = Awaited<ReturnType<AuthService['forgotPassword']>>;
+type ListSessionsResult = Awaited<ReturnType<AuthService['listSessions']>>;
+
+@ApiTags('Auth')
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Post('register')
   @RateLimit(5, 3_600_000)
-  async register(@Body() dto: RegisterDto, @Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  async register(
+    @Body() dto: RegisterDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ data: Pick<RegisterResult, 'user' | 'verification'> }> {
     const result = await this.authService.register(dto, buildContext(req));
     setAuthCookies(res, result.tokens);
     return { data: { user: result.user, verification: result.verification } };
@@ -39,7 +51,11 @@ export class AuthController {
   @Post('login')
   @HttpCode(200)
   @RateLimit(10, 900_000)
-  async login(@Body() dto: LoginDto, @Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  async login(
+    @Body() dto: LoginDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ data: Pick<LoginResult, 'user'> }> {
     const result = await this.authService.login(dto, buildContext(req));
     setAuthCookies(res, result.tokens);
     return { data: { user: result.user } };
@@ -48,7 +64,7 @@ export class AuthController {
   @Post('refresh')
   @HttpCode(200)
   @RateLimit(30, 900_000)
-  async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response): Promise<{ data: { rotated: boolean } }> {
     const raw = (req.cookies as Record<string, string> | undefined)?.[REFRESH_COOKIE];
     if (!raw) {
       throw new TokenInvalidException('No refresh token presented.');
@@ -61,7 +77,10 @@ export class AuthController {
   @Post('logout')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async logout(@CurrentUser() user: { sid: string }, @Res({ passthrough: true }) res: Response) {
+  async logout(
+    @CurrentUser() user: { sid: string },
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ data: { loggedOut: boolean } }> {
     await this.authService.logout(user.sid);
     clearAuthCookies(res);
     return { data: { loggedOut: true } };
@@ -70,7 +89,10 @@ export class AuthController {
   @Post('logout-all')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async logoutAll(@CurrentUser() user: { sub: string }, @Res({ passthrough: true }) res: Response) {
+  async logoutAll(
+    @CurrentUser() user: { sub: string },
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ data: { loggedOut: boolean } }> {
     await this.authService.logoutAll(user.sub);
     clearAuthCookies(res);
     return { data: { loggedOut: true } };
@@ -79,7 +101,7 @@ export class AuthController {
   @Post('verify')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async verify(@CurrentUser() user: { sub: string }, @Body() dto: VerifyDto) {
+  async verify(@CurrentUser() user: { sub: string }, @Body() dto: VerifyDto): Promise<{ data: { verified: boolean } }> {
     await this.authService.verify(user.sub, dto);
     return { data: { verified: true } };
   }
@@ -87,7 +109,10 @@ export class AuthController {
   @Post('verification-challenges')
   @UseGuards(JwtAuthGuard, CsrfGuard)
   @RateLimit(5, 3_600_000)
-  async requestVerification(@CurrentUser() user: { sub: string }, @Body() dto: RequestVerificationDto) {
+  async requestVerification(
+    @CurrentUser() user: { sub: string },
+    @Body() dto: RequestVerificationDto,
+  ): Promise<{ data: RequestVerificationResult }> {
     const result = await this.authService.requestVerification(user.sub, dto.channel);
     return { data: result };
   }
@@ -95,7 +120,7 @@ export class AuthController {
   @Post('password/forgot')
   @HttpCode(200)
   @RateLimit(3, 3_600_000)
-  async forgotPassword(@Body() dto: ForgotPasswordDto) {
+  async forgotPassword(@Body() dto: ForgotPasswordDto): Promise<{ data: { requested: boolean } & ForgotPasswordResult }> {
     const result = await this.authService.forgotPassword(dto);
     // `requested: true` is always identical regardless of whether the
     // account exists; devOnly* fields are dev/test-only and only present
@@ -106,14 +131,14 @@ export class AuthController {
   @Post('password/reset')
   @HttpCode(200)
   @RateLimit(5, 3_600_000)
-  async resetPassword(@Body() dto: ResetPasswordDto) {
+  async resetPassword(@Body() dto: ResetPasswordDto): Promise<{ data: { reset: boolean } }> {
     await this.authService.resetPassword(dto);
     return { data: { reset: true } };
   }
 
   @Get('sessions')
   @UseGuards(JwtAuthGuard)
-  async listSessions(@CurrentUser() user: { sub: string }) {
+  async listSessions(@CurrentUser() user: { sub: string }): Promise<{ data: ListSessionsResult }> {
     const sessions = await this.authService.listSessions(user.sub);
     return { data: sessions };
   }
@@ -121,7 +146,10 @@ export class AuthController {
   @Delete('sessions/:sessionId')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async revokeSession(@CurrentUser() user: { sub: string }, @Param('sessionId') sessionId: string) {
+  async revokeSession(
+    @CurrentUser() user: { sub: string },
+    @Param('sessionId') sessionId: string,
+  ): Promise<{ data: { revoked: boolean } }> {
     await this.authService.revokeSession(user.sub, sessionId);
     return { data: { revoked: true } };
   }

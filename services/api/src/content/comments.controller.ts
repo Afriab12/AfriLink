@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
-import { CommentsService } from './comments.service';
+import { ApiTags } from '@nestjs/swagger';
+import { CommentsService, type CommentResponse } from './comments.service';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
 import { PaginationQueryDto } from './dto/pagination-query.dto';
@@ -9,13 +10,22 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OptionalCurrentUser } from '../common/decorators/optional-current-user.decorator';
 
+interface PageMeta {
+  meta: { page: { nextCursor: string | null; hasMore: boolean } };
+}
+
+@ApiTags('Content')
 @Controller()
 export class CommentsController {
   constructor(private readonly commentsService: CommentsService) {}
 
   @Post('posts/:postId/comments')
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async create(@CurrentUser() user: { sub: string }, @Param('postId') postId: string, @Body() dto: CreateCommentDto) {
+  async create(
+    @CurrentUser() user: { sub: string },
+    @Param('postId') postId: string,
+    @Body() dto: CreateCommentDto,
+  ): Promise<{ data: CommentResponse }> {
     return { data: await this.commentsService.createComment(user.sub, postId, dto) };
   }
 
@@ -25,7 +35,7 @@ export class CommentsController {
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
     @Param('postId') postId: string,
     @Query() query: PaginationQueryDto,
-  ) {
+  ): Promise<{ data: CommentResponse[] } & PageMeta> {
     const { data, nextCursor, hasMore } = await this.commentsService.listTopLevelComments(viewer?.sub, postId, query.cursor, query.limit);
     return { data, meta: { page: { nextCursor, hasMore } } };
   }
@@ -36,21 +46,25 @@ export class CommentsController {
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
     @Param('commentId') commentId: string,
     @Query() query: PaginationQueryDto,
-  ) {
+  ): Promise<{ data: CommentResponse[] } & PageMeta> {
     const { data, nextCursor, hasMore } = await this.commentsService.listReplies(viewer?.sub, commentId, query.cursor, query.limit);
     return { data, meta: { page: { nextCursor, hasMore } } };
   }
 
   @Patch('comments/:commentId')
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async update(@CurrentUser() user: { sub: string }, @Param('commentId') commentId: string, @Body() dto: UpdateCommentDto) {
+  async update(
+    @CurrentUser() user: { sub: string },
+    @Param('commentId') commentId: string,
+    @Body() dto: UpdateCommentDto,
+  ): Promise<{ data: CommentResponse }> {
     return { data: await this.commentsService.updateComment(user.sub, commentId, dto) };
   }
 
   @Delete('comments/:commentId')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async remove(@CurrentUser() user: { sub: string }, @Param('commentId') commentId: string) {
+  async remove(@CurrentUser() user: { sub: string }, @Param('commentId') commentId: string): Promise<{ data: { deleted: boolean } }> {
     await this.commentsService.deleteComment(user.sub, commentId);
     return { data: { deleted: true } };
   }

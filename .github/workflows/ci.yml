@@ -110,6 +110,24 @@ jobs:
         working-directory: services/api
         run: npm run lint
 
+      # Verifies the OpenAPI document builder/decorators still generate
+      # successfully (job env vars above already provide DATABASE_URL/
+      # JWT_ACCESS_SECRET, same as the Build/Type check steps — no
+      # separate env file needed here). Reuses the dist/ output from the
+      # Build step above rather than rebuilding. Generation only — never
+      # published/deployed; the spec becomes a downloadable build
+      # artifact via the next step, not a commit.
+      - name: Generate OpenAPI spec
+        working-directory: services/api
+        run: node dist/generate-openapi.js
+
+      - name: Upload OpenAPI spec artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: openapi-spec
+          path: services/api/openapi/openapi.json
+          retention-days: 30
+
       # services/api's test scripts read .env.test via Node's --env-file
       # flag (matching local dev exactly) — .env.test is gitignored on
       # purpose, so CI writes its own throwaway copy here rather than the

@@ -4,7 +4,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { ProfileVisibilityService } from '../profiles/profile-visibility.service';
 import { ConflictException, PolicyRejectedException, ResourceNotFoundException } from '../common/errors/api-exception';
 
-interface FriendshipResponse {
+export interface FriendshipResponse {
   id: string;
   requesterId: string;
   addresseeId: string;

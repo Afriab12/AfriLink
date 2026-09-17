@@ -1,10 +1,12 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { SwaggerModule } from '@nestjs/swagger';
 import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { requestIdMiddleware } from './common/middleware/request-id.middleware';
+import { buildOpenApiDocument } from './openapi.config';
 
 async function bootstrap() {
   if (!process.env.JWT_ACCESS_SECRET) {
@@ -31,6 +33,11 @@ async function bootstrap() {
     origin: process.env.FRONTEND_ORIGIN ?? true,
     credentials: true,
   });
+
+  // Always generated fresh from the live decorated controllers/DTOs at
+  // boot — never a hand-maintained document that can drift from the
+  // real routes. See generate-openapi.ts for the static-file equivalent.
+  SwaggerModule.setup('api/docs', app, buildOpenApiDocument(app));
 
   const port = process.env.PORT ?? 3000;
   await app.listen(port);

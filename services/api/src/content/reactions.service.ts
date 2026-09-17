@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PostAccessService } from './post-access.service';
 import { ResourceNotFoundException } from '../common/errors/api-exception';
 
-type ReactionType = 'like' | 'love' | 'laugh' | 'support' | 'insightful';
+export type ReactionType = 'like' | 'love' | 'laugh' | 'support' | 'insightful';
 
 @Injectable()
 export class ReactionsService {
