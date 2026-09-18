@@ -51,6 +51,7 @@ export function buildOpenApiDocument(app: INestApplication): OpenAPIObject {
     .addTag('Profiles', 'Profile read/update, interests, visibility')
     .addTag('Social Graph', 'Follows, friend requests, friendships, blocks')
     .addTag('Content', 'Posts, comments/replies, reactions, shares')
+    .addTag('Messaging', 'Conversations, messages, read receipts (REST) — see docs/10-decisions/ADR-006 for the WebSocket delivery layer')
     .build();
 
   return SwaggerModule.createDocument(app, config);
