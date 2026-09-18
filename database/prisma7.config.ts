@@ -26,5 +26,10 @@ export default defineConfig({
   },
   datasource: {
     url: process.env["DATABASE_URL"],
+    // Only used by `prisma migrate diff --from-migrations`/`migrate dev`
+    // to compute a diff — a transient DB it creates, applies migrations
+    // to, diffs, then drops. Optional: unset for `migrate deploy`/
+    // `generate`, which don't need it.
+    shadowDatabaseUrl: process.env["SHADOW_DATABASE_URL"],
   },
 });

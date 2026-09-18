@@ -1,28 +1,38 @@
-// AfriLink database schema — Phase 1
+// AfriLink database schema — Phase 1 + Database Phase 2 (Communities)
 //
-// Scope: identity, reference, social, content, integration ONLY
-// (docs/04-database/database.md §25, step 2). Communities, messaging,
-// notifications, media, moderation, audit, feed, and search are added
-// incrementally in later phases and are NOT modeled here yet.
+// Phase 1 scope: identity, reference, social, content, integration
+// (docs/04-database/database.md §25, step 2).
+// Database Phase 2 scope (in progress, Communities module only): `community`
+// (docs/04-database/database.md §8). Messaging, notifications, media,
+// moderation, audit, feed, and search are still NOT modeled here yet —
+// added incrementally, one module at a time, in later phases.
 //
 // Design source of truth: docs/04-database/database.md
 // Approved decisions: docs/10-decisions/decisions.md (ADR-001, ADR-003),
 // docs/03-architecture/approval-gate.md (ADR-002)
 //
-// NOT YET APPLIED to any database. File created for review only —
-// no `prisma migrate` / `prisma db push` has been run against this schema.
-//
 // Deliberate Phase 1 omissions (see database.md for each):
 // - `content.posts.reply_to_post_id` — threaded posts are not an approved
 //   product decision (database.md §6: "only if threaded posts are approved").
 // - `content.post_media` / `content.comment_media` — depend on the `media`
-//   schema, which is not part of Phase 1.
+//   schema, which is not part of Phase 1 or this Communities increment.
 // - `content.visibility_rules` — exception-list table, not needed until a
 //   visibility exception actually arises (database.md §6).
-// - `social.profiles.avatar_media_id` and `content.posts.community_id` are
-//   modeled as plain nullable UUID columns with NO foreign key yet, because
-//   `media` and `community` schemas don't exist until a later phase. The FK
-//   is added additively when those schemas are implemented.
+// - `social.profiles.avatar_media_id` is a plain nullable UUID column with
+//   NO foreign key yet, because the `media` schema doesn't exist yet. Same
+//   treatment now applied to `community.communities.avatar_media_id` /
+//   `cover_media_id` below. `content.posts.community_id` DOES now get its
+//   foreign key, added in this increment (see Post.community below) — the
+//   `community` schema it pointed at now exists.
+//
+// Deliberate Communities-increment omission:
+// - `community.moderator_assignments` — database.md §8 frames this as
+//   conditional ("if community roles require more detail than membership
+//   roles"). `CommunityMembership.role` already gives an open, app-validated
+//   slot for "moderator", and nothing approved yet requires finer-grained
+//   scoped grants — same reasoning already applied to deferring
+//   `content.visibility_rules` in Phase 1. Added later if/when that need
+//   is concretely approved.
 
 generator client {
   provider        = "prisma-client-js"
@@ -33,7 +43,7 @@ datasource db {
   provider   = "postgresql"
   // Connection URL moved to prisma7.config.ts (Prisma 7 no longer accepts
   // `url` directly in schema.prisma — see database/prisma7.config.ts).
-  schemas    = ["identity", "reference", "social", "content", "integration"]
+  schemas    = ["identity", "reference", "social", "content", "community", "integration"]
   extensions = [citext]
 }
 
@@ -90,6 +100,10 @@ model User {
   postReactions          PostReaction[]
   commentReactions       CommentReaction[]
   shares                 Share[]
+  ownedCommunities              Community[]           @relation("CommunityOwner")
+  communityMemberships          CommunityMembership[]
+  sentCommunityInvitations      CommunityInvitation[]  @relation("CommunityInvitationInviter")
+  receivedCommunityInvitations  CommunityInvitation[]  @relation("CommunityInvitationInvitee")
 
   @@index([status, createdAt])
   @@index([deletedAt]) // deleted-at lifecycle queries, per database.md §4
@@ -415,7 +429,7 @@ enum ContentStatus {
 model Post {
   id          String        @id @default(uuid(7)) @db.Uuid
   authorId    String        @map("author_id") @db.Uuid
-  communityId String?       @map("community_id") @db.Uuid // FK to community.communities added when `community` schema exists (later phase)
+  communityId String?       @map("community_id") @db.Uuid
   body        String
   status      ContentStatus @default(published)
   visibility  String        @default("public") // public | followers | community_members | mentioned_users | private — kept as validated text, not enum, until community/mention scope exists to exercise the full set
@@ -427,6 +441,12 @@ model Post {
   updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz
 
   author    User             @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  // SetNull, not Cascade: a post shouldn't be destroyed by a (rare, hard)
+  // community deletion — it just becomes uncommunitied, same as its
+  // author's account isn't touched either. Community-membership/visibility
+  // *enforcement* for `community_members` posts is application-layer work,
+  // out of scope for this database-only Communities increment.
+  community Community?       @relation(fields: [communityId], references: [id], onDelete: SetNull)
   comments  Comment[]
   reactions PostReaction[]
   shares    Share[]
@@ -519,6 +539,133 @@ model Share {
   @@index([postId, createdAt(sort: Desc), id(sort: Desc)])
   @@map("shares")
   @@schema("content")
+}
+
+// ============================================================
+// community schema — docs/04-database/database.md §8
+// (Database Phase 2, Communities module only)
+// ============================================================
+
+// PRD §24: "Communities may be public or private according to the
+// approved MVP model" — a closed, already-approved 2-value set, so this
+// is a real enum (unlike the fields below that stay String).
+enum CommunityVisibility {
+  public
+  private
+
+  @@schema("community")
+}
+
+// database.md §8 gives this exact, explicit value list (unlike
+// `communities.status`/`membership_policy`/`memberships.role` below).
+enum CommunityMembershipStatus {
+  pending
+  active
+  rejected
+  left
+  removed
+  banned
+
+  @@schema("community")
+}
+
+model Community {
+  id               String    @id @default(uuid(7)) @db.Uuid
+  ownerUserId      String    @map("owner_user_id") @db.Uuid
+  slug             String
+  name             String
+  description      String?
+  visibility       CommunityVisibility @default(public)
+  // Not an enum: database.md §8 names this field but never enumerates its
+  // values (unlike memberships.status just below it in the same section),
+  // and PRD §24/§25 don't resolve an exact policy list either — kept as
+  // validated text, same treatment as `content.posts.visibility` until a
+  // closed set is actually approved.
+  membershipPolicy String    @default("open") @map("membership_policy")
+  avatarMediaId    String?   @map("avatar_media_id") @db.Uuid // FK to media.assets added when `media` schema exists (later phase)
+  coverMediaId     String?   @map("cover_media_id") @db.Uuid // FK to media.assets added when `media` schema exists (later phase)
+  rules            String?
+  // Not an enum, same reasoning as membershipPolicy above — database.md
+  // §8 names `status` but never enumerates it for `communities` (contrast
+  // `memberships.status`, which IS enumerated and IS a real enum below).
+  status           String    @default("active")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt        DateTime? @map("deleted_at") @db.Timestamptz
+
+  owner       User                  @relation("CommunityOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  memberships CommunityMembership[]
+  invitations CommunityInvitation[]
+  posts       Post[]
+
+  // Unique ACTIVE slug (WHERE deleted_at IS NULL) is a partial unique
+  // index in the migration SQL, not a plain @unique here — matching the
+  // Credential/UserRole/Follow/Friendship/Block active-pair pattern: a
+  // hard-deleted community's slug must be reusable.
+  @@index([status, visibility, createdAt(sort: Desc), id(sort: Desc)]) // discovery listing, excludes deleted via app-level status/deletedAt filter
+  @@index([ownerUserId])
+  @@map("communities")
+  @@schema("community")
+}
+
+model CommunityMembership {
+  id          String                    @id @default(uuid(7)) @db.Uuid
+  communityId String                    @map("community_id") @db.Uuid
+  userId      String                    @map("user_id") @db.Uuid
+  status      CommunityMembershipStatus @default(pending)
+  // Not an enum: PRD §25 explicitly states "the exact role names ... require
+  // confirmation" beyond a minimum of owner/moderator — owner is already
+  // captured by Community.ownerUserId, so this is app-validated text (e.g.
+  // "member" | "moderator") until the full role matrix is approved.
+  role        String                    @default("member")
+  requestedAt DateTime                  @default(now()) @map("requested_at") @db.Timestamptz
+  approvedAt  DateTime?                 @map("approved_at") @db.Timestamptz
+  // No FK relation, matching UserRole.grantedBy's existing precedent for
+  // "who performed this action" references — an unenforced plain UUID.
+  approvedBy  String?                   @map("approved_by") @db.Uuid
+  leftAt      DateTime?                 @map("left_at") @db.Timestamptz
+  removedAt   DateTime?                 @map("removed_at") @db.Timestamptz
+  createdAt   DateTime                  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime                  @updatedAt @map("updated_at") @db.Timestamptz
+
+  community Community @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Unique ACTIVE (community_id, user_id) — partial index (WHERE status =
+  // 'active') in the migration SQL, per database.md §8's "unique active
+  // (community_id, user_id)". A user may have multiple historical rows
+  // (left/removed, then rejoined) but at most one active membership.
+  @@index([communityId, status, createdAt, userId])
+  @@index([userId, status, createdAt, communityId])
+  @@map("memberships")
+  @@schema("community")
+}
+
+model CommunityInvitation {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  communityId String    @map("community_id") @db.Uuid
+  inviterId   String    @map("inviter_id") @db.Uuid
+  // Null = an open/link-based invite not yet targeted at a specific user;
+  // database.md §8: "invitee or token hash" — both are supported, not
+  // mutually required.
+  inviteeId   String?   @map("invitee_id") @db.Uuid
+  tokenHash   String    @map("token_hash") // hashed, single-use, per database.md §8
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz
+  acceptedAt  DateTime? @map("accepted_at") @db.Timestamptz
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  community Community @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  inviter   User      @relation("CommunityInvitationInviter", fields: [inviterId], references: [id], onDelete: Cascade)
+  invitee   User?     @relation("CommunityInvitationInvitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+
+  // Self-invite CHECK (inviter_id != invitee_id) is added in the migration
+  // SQL, matching the Follow/Friendship/Block self-action CHECK pattern.
+  @@unique([tokenHash])
+  @@index([communityId, createdAt])
+  @@index([inviteeId, acceptedAt, revokedAt])
+  @@map("invitations")
+  @@schema("community")
 }
 
 // ============================================================
