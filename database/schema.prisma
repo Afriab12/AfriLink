@@ -1,11 +1,13 @@
-// AfriLink database schema — Phase 1 + Database Phase 2 (Communities)
+// AfriLink database schema — Phase 1 + Database Phase 2 (Communities,
+// Messaging)
 //
 // Phase 1 scope: identity, reference, social, content, integration
 // (docs/04-database/database.md §25, step 2).
-// Database Phase 2 scope (in progress, Communities module only): `community`
-// (docs/04-database/database.md §8). Messaging, notifications, media,
-// moderation, audit, feed, and search are still NOT modeled here yet —
-// added incrementally, one module at a time, in later phases.
+// Database Phase 2 scope (in progress): `community` (§8), `messaging`
+// (§9) — database implementation only, no WebSocket gateway/REST
+// endpoints for messaging yet. Notifications, media, moderation, audit,
+// feed, and search are still NOT modeled here yet — added incrementally,
+// one module at a time, in later phases.
 //
 // Design source of truth: docs/04-database/database.md
 // Approved decisions: docs/10-decisions/decisions.md (ADR-001, ADR-003),
@@ -33,6 +35,37 @@
 //   scoped grants — same reasoning already applied to deferring
 //   `content.visibility_rules` in Phase 1. Added later if/when that need
 //   is concretely approved.
+//
+// Deliberate Messaging-increment omissions:
+// - `messaging.message_receipts` — database.md §9 itself frames per-message
+//   delivered/read receipts as conditional ("use conversation-level read
+//   cursors for scale, with per-message receipts only if required by
+//   product behavior"). `Participant.lastReadMessageId` already gives the
+//   preferred cursor-based read state; "delivered" is closer to the
+//   ephemeral, connection-level facts architecture.md §14/§24 says belong
+//   in Redis (presence/typing), not durable Postgres rows. Added later if
+//   per-message granularity is concretely approved.
+// - Message image attachments — PRD §19/architecture.md §14 approve them
+//   as MVP scope, but implementing them depends on the `media` schema,
+//   which doesn't exist yet — identical blocker to, and given the exact
+//   same full-deferral treatment as, `content.post_media` above. No
+//   column or table added; revisit alongside the `media` phase.
+// - A separate `message_requests` table — architecture.md §14 explicitly
+//   rules this out: "Message requests are a conversation/message state
+//   (pending vs. accepted), not a separate data model." Represented via
+//   `Conversation.status` instead (see that field's comment below).
+// - Reporting relationships (`report → message/conversation`) — the
+//   `moderation` schema they'd reference doesn't exist yet (out of scope
+//   for this increment). `Conversation`/`Message` already use the same
+//   UUID `id` scheme as everything else, so `moderation.reports` can
+//   reference them generically (e.g. target_type/target_id, matching
+//   `notification.notifications`' existing pattern) once Moderation is
+//   implemented — no schema change needed now.
+// - A messaging-specific block table — `social.blocks` (Phase 1) already
+//   represents every block relationship app-wide; messaging enforces it
+//   at the application layer (out of scope here) rather than duplicating
+//   the relationship in a new table, per this turn's explicit instruction
+//   not to redesign `social.blocks`.
 
 generator client {
   provider        = "prisma-client-js"
@@ -43,7 +76,7 @@ datasource db {
   provider   = "postgresql"
   // Connection URL moved to prisma7.config.ts (Prisma 7 no longer accepts
   // `url` directly in schema.prisma — see database/prisma7.config.ts).
-  schemas    = ["identity", "reference", "social", "content", "community", "integration"]
+  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "integration"]
   extensions = [citext]
 }
 
@@ -104,6 +137,9 @@ model User {
   communityMemberships          CommunityMembership[]
   sentCommunityInvitations      CommunityInvitation[]  @relation("CommunityInvitationInviter")
   receivedCommunityInvitations  CommunityInvitation[]  @relation("CommunityInvitationInvitee")
+  createdConversations          Conversation[]         @relation("ConversationCreator")
+  conversationParticipations    Participant[]
+  sentMessages                  Message[]              @relation("MessageSender")
 
   @@index([status, createdAt])
   @@index([deletedAt]) // deleted-at lifecycle queries, per database.md §4
@@ -666,6 +702,159 @@ model CommunityInvitation {
   @@index([inviteeId, acceptedAt, revokedAt])
   @@map("invitations")
   @@schema("community")
+}
+
+// ============================================================
+// messaging schema — docs/04-database/database.md §9
+// (Database Phase 2, Messaging module only — database implementation
+// only; no WebSocket gateway, REST endpoints, services, or DTOs)
+// ============================================================
+
+// Mirrors content.ContentStatus's published/hidden/removed concept, but
+// intentionally a separate enum (not a cross-schema reference to
+// content.ContentStatus) — architecture.md principle #3: each module
+// owns its business rules and persistence boundary. "active" instead of
+// "published" since a message isn't "published" the way a post is.
+enum MessageModerationState {
+  active
+  hidden
+  removed
+
+  @@schema("messaging")
+}
+
+model Conversation {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  // CHECK-constrained to 'direct' only for as long as messaging stays
+  // MVP scope (ADR-002 §7: one-to-one only; database.md §9 "Phase
+  // scoping" — the column exists so group conversations don't require a
+  // restructure later; widening the CHECK to add 'group' when approved
+  // is a pure additive migration, not attempted here).
+  kind      String    @default("direct")
+  createdBy String?   @map("created_by") @db.Uuid
+  title     String?
+  // Not an enum: database.md §9 names this field but never enumerates
+  // it. Carries the message-request pending/accepted state per
+  // architecture.md §14 ("a conversation/message state ... not a
+  // separate data model, so accepting a request is a state transition")
+  // — default 'pending' until the application marks it accepted,
+  // matching PRD §19's hold-until-accepted flow for a first message
+  // from a non-connection.
+  status    String    @default("pending")
+  // Denormalized canonical unordered pair, 'direct' conversations ONLY
+  // (NULL for any future non-direct kind) — added beyond database.md
+  // §9's literal field list specifically so the database itself can
+  // guarantee "at most one direct conversation per pair" via the
+  // partial unique index in the migration SQL (LEAST/GREATEST, exactly
+  // mirroring social.friendships' existing unordered-pair pattern)
+  // instead of relying on application-level dedup logic — this turn's
+  // explicit requirement. Kept in sync with `participants` by whichever
+  // future application code creates the conversation.
+  directParticipantAId String? @map("direct_participant_a_id") @db.Uuid
+  directParticipantBId String? @map("direct_participant_b_id") @db.Uuid
+  lastMessageAt DateTime? @map("last_message_at") @db.Timestamptz
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt     DateTime? @map("deleted_at") @db.Timestamptz
+
+  // SetNull: who started a conversation is metadata, not something that
+  // should block a (hard, rare) user deletion or cascade-destroy the
+  // conversation/messages the other participant still relies on.
+  creator      User?         @relation("ConversationCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+  participants Participant[]
+  messages     Message[]
+
+  // directParticipantAId/BId intentionally have NO Prisma @relation to
+  // User here (would add two more User back-relations purely for a
+  // uniqueness bookkeeping device that's never traversed in application
+  // code — `participants` is the real relation for "who's in this
+  // conversation"). Their foreign keys are added directly in the
+  // migration SQL instead, same treatment as the hand-added CHECK/
+  // partial-unique-index block.
+  @@index([lastMessageAt(sort: Desc), id(sort: Desc)])
+  @@map("conversations")
+  @@schema("messaging")
+}
+
+model Participant {
+  conversationId    String    @map("conversation_id") @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  // Not an enum, same reasoning as Conversation.status — database.md §9
+  // names but doesn't enumerate this.
+  role              String    @default("member")
+  joinedAt          DateTime  @default(now()) @map("joined_at") @db.Timestamptz
+  leftAt            DateTime? @map("left_at") @db.Timestamptz
+  mutedUntil        DateTime? @map("muted_until") @db.Timestamptz
+  // The conversation-level read cursor database.md §9's
+  // message_receipts section itself recommends preferring for scale
+  // ("use conversation-level read cursors ... with per-message receipts
+  // only if required") — see schema.prisma header / migration review
+  // for why `messaging.message_receipts` itself is deferred.
+  lastReadMessageId String?   @map("last_read_message_id") @db.Uuid
+  status            String    @default("active")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // No FK on lastReadMessageId -> Message: would create a circular
+  // cross-table dependency for a pointer field, and messages are
+  // append-only/soft-deleted (never hard-removed in normal operation),
+  // so integrity risk is low — matches the existing no-FK-on-"pointer"
+  // precedent (identity.user_roles.granted_by, community.memberships.
+  // approved_by).
+
+  // No separate `id`/active-pair partial index needed: database.md §9
+  // lists no `id` field for this table, and the composite primary key
+  // below already guarantees at most one row ever exists per
+  // (conversation_id, user_id) — trivially satisfying "unique active
+  // (conversation_id, user_id)" since there's only ever one row, active
+  // or not (unlike community.memberships, which explicitly allows
+  // multiple historical rows for leave-then-rejoin).
+  @@id([conversationId, userId])
+  @@index([userId, status, lastReadMessageId])
+  @@map("participants")
+  @@schema("messaging")
+}
+
+model Message {
+  id               String                 @id @default(uuid(7)) @db.Uuid
+  conversationId   String                 @map("conversation_id") @db.Uuid
+  senderId         String                 @map("sender_id") @db.Uuid
+  // Client-supplied idempotency key so retried sends (mobile networks)
+  // are safe — paired with sender_id in a unique constraint below, per
+  // database.md §9. Distinct from integration.idempotency_keys (that
+  // table is generic command/response caching; this is message-send-
+  // specific and cheaper to check on the hot send path).
+  clientMessageId String                  @map("client_message_id")
+  body             String
+  // Not an enum — see Conversation.status comment; database.md §9 names
+  // but doesn't enumerate this. Exact send-lifecycle values are left
+  // for the future messaging API to define.
+  status           String                 @default("sent")
+  moderationState  MessageModerationState @default(active) @map("moderation_state")
+  replyToMessageId String?                @map("reply_to_message_id") @db.Uuid
+  createdAt        DateTime               @default(now()) @map("created_at") @db.Timestamptz
+  editedAt         DateTime?              @map("edited_at") @db.Timestamptz
+  deletedAt        DateTime?              @map("deleted_at") @db.Timestamptz
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  // Restrict, not Cascade: a message belongs to BOTH participants'
+  // shared history, not solely to its sender the way a Post belongs
+  // solely to its author — hard-deleting the sender's user row must not
+  // silently wipe the other participant's conversation history.
+  // database.md §9's own 90-day deleted_at-then-purge/tombstone process
+  // (ADR-003 §5) is the correct, explicit path for removing a departed
+  // user's messages, not an FK-cascade side-effect.
+  sender         User         @relation("MessageSender", fields: [senderId], references: [id], onDelete: Restrict)
+  // Restrict, matching Comment.parentComment's existing precedent for
+  // the same self-referencing-reply shape.
+  replyToMessage Message?     @relation("MessageReplies", fields: [replyToMessageId], references: [id], onDelete: Restrict)
+  replies        Message[]    @relation("MessageReplies")
+
+  @@unique([senderId, clientMessageId])
+  @@index([conversationId, createdAt, id])
+  @@index([senderId, createdAt])
+  @@map("messages")
+  @@schema("messaging")
 }
 
 // ============================================================
