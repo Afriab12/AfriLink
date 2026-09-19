@@ -1,13 +1,12 @@
 // AfriLink database schema — Phase 1 + Database Phase 2 (Communities,
-// Messaging)
+// Messaging, Notifications)
 //
 // Phase 1 scope: identity, reference, social, content, integration
 // (docs/04-database/database.md §25, step 2).
 // Database Phase 2 scope (in progress): `community` (§8), `messaging`
-// (§9) — database implementation only, no WebSocket gateway/REST
-// endpoints for messaging yet. Notifications, media, moderation, audit,
-// feed, and search are still NOT modeled here yet — added incrementally,
-// one module at a time, in later phases.
+// (§9), `notification` (§10). Media, moderation, audit, feed, and search
+// are still NOT modeled here yet — added incrementally, one module at a
+// time, in later phases.
 //
 // Design source of truth: docs/04-database/database.md
 // Approved decisions: docs/10-decisions/decisions.md (ADR-001, ADR-003),
@@ -66,6 +65,31 @@
 //   at the application layer (out of scope here) rather than duplicating
 //   the relationship in a new table, per this turn's explicit instruction
 //   not to redesign `social.blocks`.
+//
+// Deliberate Notifications-increment omissions and decisions:
+// - `notification.deliveries` — database.md §10 designs it for push/email/
+//   SMS provider attempts (retry, provider message IDs, reconciliation).
+//   Those channels are still an open product/vendor decision
+//   (approval-gate.md: "whether push/email/SMS ship at MVP versus in-app
+//   only"), and MVP in-app notifications are plain REST-polled rows
+//   (ADR-004 §7) with no provider attempt to record. Nothing to attach
+//   delivery rows to yet — added when a channel is actually approved.
+// - No notification-type/category vocabulary is defined here. Neither
+//   database.md §10, PRD §20, nor any ADR enumerates one (PRD only names
+//   broad areas: relationships, posts, comments, reactions, shares,
+//   community events, messages, verification, moderation outcomes), so
+//   `type`/`category` stay app-validated strings — same treatment as
+//   `content.posts.visibility` — rather than inventing a closed set.
+// - No notification retention period is defined here. No approved
+//   document sets one (ADR-001/ADR-003 cover content, messages, accounts;
+//   architecture.md treats notifications as derived/rebuildable). The
+//   schema only supplies the lifecycle hooks (`deleted_at`, indexed) a
+//   future retention job needs; the window itself is an open decision.
+// - Message/post/comment/etc. targets are referenced polymorphically via
+//   `target_type`/`target_id` with NO foreign key, as database.md §10
+//   designs it — a notification must survive (and re-resolve visibility
+//   against) its target, and notification payloads never carry message
+//   bodies.
 
 generator client {
   provider        = "prisma-client-js"
@@ -76,7 +100,7 @@ datasource db {
   provider   = "postgresql"
   // Connection URL moved to prisma7.config.ts (Prisma 7 no longer accepts
   // `url` directly in schema.prisma — see database/prisma7.config.ts).
-  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "integration"]
+  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "notification", "integration"]
   extensions = [citext]
 }
 
@@ -138,8 +162,13 @@ model User {
   sentCommunityInvitations      CommunityInvitation[]  @relation("CommunityInvitationInviter")
   receivedCommunityInvitations  CommunityInvitation[]  @relation("CommunityInvitationInvitee")
   createdConversations          Conversation[]         @relation("ConversationCreator")
+  directConversationsAsA        Conversation[]         @relation("ConversationDirectParticipantA")
+  directConversationsAsB        Conversation[]         @relation("ConversationDirectParticipantB")
   conversationParticipations    Participant[]
   sentMessages                  Message[]              @relation("MessageSender")
+  receivedNotifications         Notification[]         @relation("NotificationRecipient")
+  triggeredNotifications        Notification[]         @relation("NotificationActor")
+  notificationPreferences       NotificationPreference[]
 
   @@index([status, createdAt])
   @@index([deletedAt]) // deleted-at lifecycle queries, per database.md §4
@@ -764,13 +793,19 @@ model Conversation {
   participants Participant[]
   messages     Message[]
 
-  // directParticipantAId/BId intentionally have NO Prisma @relation to
-  // User here (would add two more User back-relations purely for a
-  // uniqueness bookkeeping device that's never traversed in application
-  // code — `participants` is the real relation for "who's in this
-  // conversation"). Their foreign keys are added directly in the
-  // migration SQL instead, same treatment as the hand-added CHECK/
-  // partial-unique-index block.
+  // Restrict, matching messages.sender_id's reasoning: a direct
+  // conversation's pairing identity must not silently break via an
+  // unrelated hard user delete. These two relations exist so Prisma's
+  // diff engine recognizes the foreign keys the messaging migration
+  // already created — without them every `migrate diff` proposed
+  // dropping those FKs. They are bookkeeping for the pair-uniqueness
+  // index and are not traversed by application code (`participants` is
+  // the real "who is in this conversation" relation). The CHECKs and the
+  // LEAST/GREATEST partial unique index remain hand-added in the
+  // migration SQL.
+  directParticipantA User? @relation("ConversationDirectParticipantA", fields: [directParticipantAId], references: [id], onDelete: Restrict)
+  directParticipantB User? @relation("ConversationDirectParticipantB", fields: [directParticipantBId], references: [id], onDelete: Restrict)
+
   @@index([lastMessageAt(sort: Desc), id(sort: Desc)])
   @@map("conversations")
   @@schema("messaging")
@@ -855,6 +890,92 @@ model Message {
   @@index([senderId, createdAt])
   @@map("messages")
   @@schema("messaging")
+}
+
+// ============================================================
+// notification schema — docs/04-database/database.md §10
+// (Database Phase 2, Notifications module only — MVP is REST-polled
+// in-app notifications, no WebSocket/push, ADR-004 §7)
+// ============================================================
+
+model Notification {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  recipientUserId String    @map("recipient_user_id") @db.Uuid
+  // Null for system-originated notifications (e.g. verification,
+  // moderation outcomes) that have no acting user.
+  actorUserId     String?   @map("actor_user_id") @db.Uuid
+  // Not an enum — see the header comment: no approved type vocabulary
+  // exists to close over yet.
+  type            String
+  // Polymorphic reference to the thing the notification is about
+  // (post, comment, conversation, community, ...) — deliberately no FK.
+  // Both set or both null (CHECK in the migration SQL).
+  targetType      String?   @map("target_type")
+  targetId        String?   @map("target_id") @db.Uuid
+  // Grouping/aggregation of repeated activity for display (PRD §20:
+  // "avoid excessive duplicate notifications through grouping").
+  groupKey        String?   @map("group_key")
+  // Idempotency key for repeated domain events (database.md §10
+  // "deduplication key") — the outbox is at-least-once, so replaying an
+  // event must not create a second notification. Unique per recipient;
+  // NULLs never collide, so a notification without one is unconstrained.
+  // Deliberately includes soft-deleted rows: a replayed event must not
+  // resurrect a notification the user already dismissed.
+  dedupKey        String?   @map("dedup_key")
+  // Safe display metadata only — never message bodies or other sensitive
+  // content (database.md §10; architecture.md §15).
+  payload         Json?
+  readAt          DateTime? @map("read_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz
+
+  // Cascade: a notification belongs to its recipient, and is derived/
+  // rebuildable state (architecture.md principle #5) — unlike shared
+  // message history, nothing else depends on it outliving the recipient.
+  recipient User  @relation("NotificationRecipient", fields: [recipientUserId], references: [id], onDelete: Cascade)
+  // SetNull: who triggered it is display metadata; a hard actor deletion
+  // must not delete the recipient's notification.
+  actor     User? @relation("NotificationActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  // Self-notification CHECK, paired-target CHECK and the partial index for
+  // unread queries are in the migration SQL (not expressible here).
+  @@unique([recipientUserId, dedupKey])
+  @@index([recipientUserId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([deletedAt]) // retention/purge processing hook, same as identity.users
+  @@map("notifications")
+  @@schema("notification")
+}
+
+model NotificationPreference {
+  userId    String   @map("user_id") @db.Uuid
+  // Not enums: channels and categories are both still open decisions
+  // (push/email/SMS channels; no approved category list).
+  category  String
+  channel   String
+  // No default on purpose: channels beyond in-app require consent (PRD
+  // §20), so a wrong implicit "true" would be a consent bug. A row is only
+  // written when the user (or the app on their behalf) makes an explicit
+  // choice; absence of a row means "use the defaults in
+  // social.user_preferences.notification_defaults".
+  enabled   Boolean
+  // Optional per-(category, channel) overrides listed in database.md
+  // §10. NULL = inherit from the single source of truth
+  // (social.user_preferences.quiet_hours_* / identity.users.locale) so
+  // there is no duplicate authoritative copy.
+  locale          String?
+  quietHoursStart String?  @map("quiet_hours_start") // "HH:MM", app-validated, like social.user_preferences
+  quietHoursEnd   String?  @map("quiet_hours_end")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Composite PK = "one row per (user_id, category, channel)"
+  // (database.md §10); the table has no separate id, same as
+  // content.post_reactions / messaging.participants.
+  @@id([userId, category, channel])
+  @@map("preferences")
+  @@schema("notification")
 }
 
 // ============================================================
