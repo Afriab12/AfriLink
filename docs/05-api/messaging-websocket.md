@@ -329,8 +329,43 @@ Rows marked **Not implemented** or **Gap** are open follow-up work, not changes 
 
 ### Tracked follow-ups
 
+Known follow-ups for the messaging WebSocket. **All six are open, unscheduled and not started.** They are gaps against the approved design (ADR-006), not changes to it. Each needs its own test-first change and approval; tick the box and update §14's table when one closes.
+
+- [ ] **F-1** — Evict sockets from `conversation:{id}` when a participant is blocked or leaves
+- [ ] **F-2** — Re-check token expiry at `conversation.join`
+- [ ] **F-3** — Disconnect sockets on logout and on session revocation
+- [ ] **F-4** — Explicit `Origin` validation on the WebSocket upgrade
+- [ ] **F-5** — Throttle connection attempts and room joins
+- [ ] **F-6** — Event envelope (event ID, version, timestamp)
+
 **F-1 — Evict sockets from `conversation:{id}` when a participant is blocked or leaves (open, not scheduled).**
 Probe result (2026-09-19, throwaway test, not committed): a socket that has joined a room **stays a member** after the user is blocked or after their `participants.left_at` is set; nothing removes it.
 - **After a block — latent.** Nothing reaches the blocked socket today, because every REST action by either party is rejected (bidirectional block) before it emits. It would leak as soon as any event source not gated on the block exists.
 - **After `left_at` — real leak.** The remaining participant can still send, and the departed user's already-joined socket **receives `message.accepted`**. No REST leave/remove endpoint exists yet, so this is not reachable through the API today; it becomes live when leave, removal or conversation soft-delete is added.
 - **Fix direction (not designed here):** on block, leave and conversation deletion, remove that user's sockets from the room server-side (`socketsLeave`), and re-check access before emitting. Needs its own test-first change; also relates to the "Disconnect on logout" and token-expiry rows above.
+
+**F-2 — Re-check token expiry at `conversation.join` (open, not scheduled).**
+- **Gap:** the access token is verified once, at the handshake. `conversation.join` re-checks membership and blocks but not token expiry, so an established socket stays authorized after its 15-minute access token expires, until it disconnects.
+- **Design:** §3 "Access-token expiration".
+- **Notes:** the token's expiry has to be kept on the socket at handshake time. Decide what an expired token does at join: reject that join with an acknowledgement error, or disconnect. This alone does **not** stop events to rooms the socket already joined; that is F-3's territory.
+
+**F-3 — Disconnect sockets on logout and on session revocation (open, not scheduled).**
+- **Gap:** nothing links a socket to a session. `POST /auth/logout`, and the refresh-token-reuse revocation of all sessions (ADR-004 §3), do not disconnect open sockets.
+- **Impact:** a logged-out or revoked session keeps receiving events until it disconnects. REST is bounded to at most 15 minutes by access-token expiry; the socket has no such bound.
+- **Design:** §3 "Logout behavior" and "Revoked-session behavior" (map `sid` to sockets; send a typed `SESSION_REVOKED` `error` event immediately before closing).
+- **Notes:** how Auth notifies the gateway is a design decision to make first; it should not turn into a direct Auth-to-Messaging import.
+
+**F-4 — Explicit `Origin` validation on the WebSocket upgrade (open, not scheduled).**
+- **Gap:** only Socket.IO's `cors` option is set; there is no `allowRequest` Origin check. Cross-site protection rests on the `SameSite=Lax` cookie policy (ADR-004 §1) alone.
+- **Design:** §4 "WebSocket handshake origin validation" (same allow-list as REST CORS; reject before authentication runs).
+- **Notes:** a decision is needed on requests with **no** `Origin` header. Native mobile clients typically send none and authenticate with the handshake `auth.accessToken`, so a strict check must not break them.
+
+**F-5 — Throttle connection attempts and room joins (open, not scheduled).**
+- **Gap:** handshake attempts (per IP) and `conversation.join` (per user) are not throttled. The existing `RateLimitGuard` covers HTTP routes only, keys by IP, and keeps counters in memory in a single process. Only the invalid-request strike counter exists (20 malformed joins per connection, then `error` and disconnect).
+- **Design:** §11 "Rate limiting / abuse protection".
+- **Notes:** a per-process in-memory counter is enough for the single-process MVP; it stops holding if a second instance or the Redis adapter (§12) is introduced.
+
+**F-6 — Event envelope: event ID, version, timestamp (open, not scheduled).**
+- **Gap:** every event's payload is the affected resource itself; there is no event ID, version or timestamp, as `architecture.md` §24 specifies.
+- **Impact:** clients cannot deduplicate, order or detect gaps from events alone. The REST cursor endpoints remain the durable recovery path (§8), so nothing is lost, only less convenient.
+- **Notes:** adding an envelope changes the payload shape of every event, which is an API contract change. It needs explicit approval and a versioning plan, and must not be done silently.
