@@ -182,6 +182,160 @@ describe('Messaging (e2e)', () => {
       expect(page1.body.meta.page.hasMore).toBe(true);
     });
 
+    // ---- List ordering: by last_message_at (descending), the inbox order ----
+    // The conversation list is ordered by most recent message, with
+    // conversations that have no messages yet after every conversation that
+    // has one, and id (UUIDv7, time-ordered) as the tie-breaker. The cursor
+    // carries that same (last_message_at, id) key.
+    describe('list ordering by last_message_at', () => {
+      type ConvUser = { userId: string; cookies: Record<string, string> };
+
+      async function startConversation(from: ConvUser, to: ConvUser): Promise<string> {
+        const res = await request(app.getHttpServer())
+          .post('/api/v1/conversations')
+          .set(auth(from))
+          .send({ recipientUserId: to.userId })
+          .expect(201);
+        return res.body.data.id as string;
+      }
+
+      // The initiator may send while a conversation is still pending.
+      async function say(from: ConvUser, conversationId: string): Promise<void> {
+        await request(app.getHttpServer())
+          .post(`/api/v1/conversations/${conversationId}/messages`)
+          .set(auth(from))
+          .send({ body: 'hi', clientMessageId: randomUUID() })
+          .expect(201);
+      }
+
+      async function listIds(u: ConvUser, query = ''): Promise<string[]> {
+        const res = await request(app.getHttpServer()).get(`/api/v1/conversations${query}`).set(auth(u)).expect(200);
+        return res.body.data.map((c: { id: string }) => c.id);
+      }
+
+      async function walkAllPages(u: ConvUser, limit: number): Promise<string[]> {
+        const seen: string[] = [];
+        let cursor: string | null = null;
+        for (let guard = 0; guard < 20; guard++) {
+          const qs: string = `?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+          const res: request.Response = await request(app.getHttpServer()).get(`/api/v1/conversations${qs}`).set(auth(u)).expect(200);
+          seen.push(...res.body.data.map((c: { id: string }) => c.id));
+          if (!res.body.meta.page.hasMore) {
+            return seen;
+          }
+          cursor = res.body.meta.page.nextCursor as string;
+        }
+        throw new Error('pagination did not terminate');
+      }
+
+      it('orders by most recent message, and new activity moves a conversation to the top', async () => {
+        const a = await registerUser();
+        const [p1, p2, p3] = [await registerUser(), await registerUser(), await registerUser()];
+        const c1 = await startConversation(a, p1);
+        const c2 = await startConversation(a, p2);
+        const c3 = await startConversation(a, p3);
+
+        await say(a, c1);
+        await say(a, c2);
+        await say(a, c3);
+        expect(await listIds(a)).toEqual([c3, c2, c1]);
+
+        await say(a, c1); // fresh activity in the oldest conversation
+        expect(await listIds(a)).toEqual([c1, c3, c2]);
+
+        const res = await request(app.getHttpServer()).get('/api/v1/conversations').set(auth(a)).expect(200);
+        const stamps: number[] = res.body.data.map((c: { lastMessageAt: string }) => new Date(c.lastMessageAt).getTime());
+        expect(stamps).toEqual([...stamps].sort((x, y) => y - x));
+      });
+
+      it('lists conversations with no messages after every conversation that has one, regardless of creation order', async () => {
+        const a = await registerUser();
+        const [p1, p2, p3] = [await registerUser(), await registerUser(), await registerUser()];
+        const messaged = await startConversation(a, p1); // created FIRST
+        const emptyOlder = await startConversation(a, p2);
+        const emptyNewer = await startConversation(a, p3);
+        await say(a, messaged);
+
+        expect(await listIds(a)).toEqual([messaged, emptyNewer, emptyOlder]);
+      });
+
+      it('paginates across the messaged/empty boundary without skipping or duplicating', async () => {
+        const a = await registerUser();
+        const partners = [await registerUser(), await registerUser(), await registerUser(), await registerUser(), await registerUser()];
+        const ids: string[] = [];
+        for (const p of partners) {
+          ids.push(await startConversation(a, p));
+        }
+        // Message three of the five, in a deliberately non-creation order.
+        await say(a, ids[1]);
+        await say(a, ids[3]);
+        await say(a, ids[0]);
+
+        const expected = [ids[0], ids[3], ids[1], ids[4], ids[2]]; // messaged newest-first, then empty newest-created-first
+        expect(await listIds(a)).toEqual(expected);
+        expect(await walkAllPages(a, 1)).toEqual(expected);
+        expect(await walkAllPages(a, 2)).toEqual(expected);
+      });
+
+      it('breaks last_message_at ties by id so pagination stays stable', async () => {
+        const a = await registerUser();
+        const partners = [await registerUser(), await registerUser(), await registerUser(), await registerUser()];
+        const ids: string[] = [];
+        for (const p of partners) {
+          const id = await startConversation(a, p);
+          await say(a, id);
+          ids.push(id);
+        }
+        const sameInstant = new Date('2030-01-01T00:00:00.000Z');
+        await prisma.conversation.updateMany({ where: { id: { in: ids } }, data: { lastMessageAt: sameInstant } });
+
+        const expected = [...ids].sort().reverse(); // UUIDv7 ids sort in creation order
+        expect(await walkAllPages(a, 1)).toEqual(expected);
+        expect(await walkAllPages(a, 3)).toEqual(expected);
+      });
+
+      it('shows the same recency ordering to the recipient', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+        const [p2, p3] = [await registerUser(), await registerUser()];
+        const withB = await startConversation(a, b);
+        const other2 = await startConversation(p2, b);
+        const other3 = await startConversation(p3, b);
+        await say(a, withB);
+        await say(p3, other3);
+        await say(p2, other2);
+        await say(a, withB);
+
+        expect(await listIds(b)).toEqual([withB, other2, other3]);
+      });
+
+      it('rejects malformed and legacy (createdAt-shaped) cursors with INVALID_CURSOR', async () => {
+        const a = await registerUser();
+        const garbage = await request(app.getHttpServer()).get('/api/v1/conversations?cursor=not-a-real-cursor!!').set(auth(a)).expect(400);
+        expect(garbage.body.error.code).toBe('INVALID_CURSOR');
+
+        const legacy = Buffer.from(JSON.stringify({ createdAt: new Date().toISOString(), id: randomUUID() })).toString('base64url');
+        const res = await request(app.getHttpServer()).get(`/api/v1/conversations?cursor=${legacy}`).set(auth(a)).expect(400);
+        expect(res.body.error.code).toBe('INVALID_CURSOR');
+      });
+
+      it('last_message_at only ever moves forward, even if a send lands after a newer one', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+        const id = await startConversation(a, b);
+        await say(a, id);
+
+        // Simulate a newer send from the other participant having already
+        // committed its update (the concurrent-send interleaving).
+        const newer = new Date(Date.now() + 60 * 60 * 1000);
+        await prisma.conversation.update({ where: { id }, data: { lastMessageAt: newer } });
+
+        await say(a, id); // this message's timestamp is OLDER than `newer`
+        const row = await prisma.conversation.findUnique({ where: { id } });
+        expect(row?.lastMessageAt?.getTime()).toBe(newer.getTime());
+      });
+    });
+
     it('only the recipient may accept or decline a pending request', async () => {
       const a = await registerUser();
       const b = await registerUser();

@@ -76,7 +76,14 @@ export class MessagesService {
         body: dto.body,
       },
     });
-    await this.prisma.conversation.update({ where: { id: conversationId }, data: { lastMessageAt: message.createdAt } });
+    // Only ever advance last_message_at: the conversation list is ordered by
+    // it. Two concurrent sends can commit their message rows in one order and
+    // run this update in the other; an unconditional write would let the older
+    // timestamp overwrite the newer one and mis-order the inbox.
+    await this.prisma.conversation.updateMany({
+      where: { id: conversationId, OR: [{ lastMessageAt: null }, { lastMessageAt: { lt: message.createdAt } }] },
+      data: { lastMessageAt: message.createdAt },
+    });
 
     const response = this.toResponse(message);
     this.gateway.emitToConversation(conversationId, 'message.accepted', response);
