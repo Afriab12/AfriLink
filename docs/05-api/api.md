@@ -403,6 +403,16 @@ No missing constraints, ambiguous relationships, or concurrency risks were found
 | Communities/Notifications API implementation | Database layers exist; no REST API yet | Open — contracts to be finalized before implementation |
 | Feed/Media/Moderation/Admin/Search implementation | All remaining §15 rows | Open — blocked on their Database Phase 2 modules, contracts defined so implementation won't retrofit badly |
 
+### Tracked API follow-ups
+
+Known defects and gaps in the implemented API that are **not** design decisions, so they do not belong in the table above. All are open and unscheduled; each needs its own test-first change and approval. (Messaging WebSocket follow-ups F-1 to F-6 are tracked separately in `docs/05-api/messaging-websocket.md` §14.)
+
+- [ ] **T-1 — Malformed UUID path parameters return `500 INTERNAL_ERROR` instead of `422 VALIDATION_FAILED`.**
+  - **Verified 2026-09-20** with a probe of 15 routes across content, messaging, social graph and auth (for example `GET /conversations/not-a-uuid`, `PATCH /messages/not-a-uuid`, `GET /posts/not-a-uuid`, `POST /users/not-a-uuid/follow`, `DELETE /auth/sessions/not-a-uuid`): **all 15 returned `500 INTERNAL_ERROR`**, and the server logs a full Prisma error each time. About 30 routes take an ID path parameter and pass the raw string to Prisma; none uses `ParseUUIDPipe` or a validated DTO. The routes not probed follow the same pattern, but were not tested. `GET /profiles/{userIdOrHandle}` accepts a handle and is not in scope.
+  - **Expected (§6):** `422 VALIDATION_FAILED` with a field-mapped `details` entry.
+  - **Impact:** no data is exposed (the response body is the generic error), but it breaks the §6 error contract, inflates 500-rate monitoring and alerting, and lets any authenticated user generate server errors and error logs at will.
+  - **Fix direction (not designed here):** one shared path-parameter DTO or pipe with `@IsUUID()`, applied to every ID route, with a regression test per module. The Notifications API validates its IDs correctly from the start, so it does not add to this list.
+
 ## 19. Recommended order after approval
 
 1. ~~Approve ADR-004 (cookies/CSRF, pagination, WebSocket boundary, notifications-REST-only).~~ Done — ADR-004 is approved and implemented.
