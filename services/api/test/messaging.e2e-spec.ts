@@ -330,6 +330,63 @@ describe('Messaging (e2e)', () => {
       expect(participant?.lastReadMessageId).toBe(sent.body.data.id);
     });
 
+    // Regression: assertOwnsMessage used to check sender identity only, so a
+    // sender who had lost access to the conversation (blocked either way,
+    // left, or conversation soft-deleted) could still edit or delete their
+    // own old messages. Every message action must go through the same
+    // conversation-access rule (MessagingAccessService).
+    describe('edit/delete requires conversation access, not just authorship', () => {
+      async function sendOne() {
+        const { a, b, conversationId } = await startAcceptedConversation();
+        const sent = await request(app.getHttpServer())
+          .post(`/api/v1/conversations/${conversationId}/messages`)
+          .set(auth(a))
+          .send({ body: 'original', clientMessageId: randomUUID() })
+          .expect(201);
+        return { a, b, conversationId, messageId: sent.body.data.id as string };
+      }
+
+      async function expectRejectedAndUntouched(sender: { cookies: Record<string, string> }, messageId: string) {
+        await request(app.getHttpServer()).patch(`/api/v1/messages/${messageId}`).set(auth(sender)).send({ body: 'rewritten' }).expect(404);
+        await request(app.getHttpServer()).delete(`/api/v1/messages/${messageId}`).set(auth(sender)).expect(404);
+        const row = await prisma.message.findUniqueOrThrow({ where: { id: messageId } });
+        expect(row.body).toBe('original');
+        expect(row.editedAt).toBeNull();
+        expect(row.deletedAt).toBeNull();
+      }
+
+      it('a sender who was blocked by the other participant cannot edit or delete their message', async () => {
+        const { a, b, messageId } = await sendOne();
+        await request(app.getHttpServer()).post(`/api/v1/users/${a.userId}/block`).set(auth(b)).expect(201);
+        await expectRejectedAndUntouched(a, messageId);
+      });
+
+      it('a sender who blocked the other participant cannot edit or delete their message either', async () => {
+        const { a, b, messageId } = await sendOne();
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/block`).set(auth(a)).expect(201);
+        await expectRejectedAndUntouched(a, messageId);
+      });
+
+      it('a sender who left the conversation cannot edit or delete their message', async () => {
+        const { a, conversationId, messageId } = await sendOne();
+        // No REST endpoint for leaving exists yet; set the participant state directly.
+        await prisma.participant.update({ where: { conversationId_userId: { conversationId, userId: a.userId } }, data: { leftAt: new Date() } });
+        await expectRejectedAndUntouched(a, messageId);
+      });
+
+      it('nobody can edit or delete a message in a soft-deleted conversation', async () => {
+        const { a, conversationId, messageId } = await sendOne();
+        await prisma.conversation.update({ where: { id: conversationId }, data: { deletedAt: new Date() } });
+        await expectRejectedAndUntouched(a, messageId);
+      });
+
+      it('an ordinary participant can still edit and delete (access check does not over-reject)', async () => {
+        const { a, messageId } = await sendOne();
+        await request(app.getHttpServer()).patch(`/api/v1/messages/${messageId}`).set(auth(a)).send({ body: 'fine' }).expect(200);
+        await request(app.getHttpServer()).delete(`/api/v1/messages/${messageId}`).set(auth(a)).expect(200);
+      });
+    });
+
     it('blocking a participant hides the conversation and rejects further sends for both directions', async () => {
       const { a, b, conversationId } = await startAcceptedConversation();
       await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/block`).set(auth(a)).expect(201);
@@ -496,6 +553,28 @@ describe('Messaging (e2e)', () => {
 
       const event = await eventPromise;
       expect(event.id).toBe(sent.body.data.id);
+    });
+
+    // Regression companion to the REST tests above: a rejected edit/delete
+    // must not reach the room. (The rejection happens before the emit.)
+    it('a blocked sender\'s rejected edit and delete are not broadcast to the room', async () => {
+      const { a, b, conversationId, socketB } = await joinedPair();
+      const sent = await request(app.getHttpServer())
+        .post(`/api/v1/conversations/${conversationId}/messages`)
+        .set(auth(a))
+        .send({ body: 'original', clientMessageId: randomUUID() })
+        .expect(201);
+      await request(app.getHttpServer()).post(`/api/v1/users/${a.userId}/block`).set(auth(b)).expect(201);
+
+      const received: string[] = [];
+      socketB.on('message.updated', () => received.push('message.updated'));
+      socketB.on('message.deleted', () => received.push('message.deleted'));
+
+      await request(app.getHttpServer()).patch(`/api/v1/messages/${sent.body.data.id}`).set(auth(a)).send({ body: 'rewritten' }).expect(404);
+      await request(app.getHttpServer()).delete(`/api/v1/messages/${sent.body.data.id}`).set(auth(a)).expect(404);
+      await new Promise((r) => setTimeout(r, 500)); // give any (buggy) emit time to arrive
+
+      expect(received).toEqual([]);
     });
 
     it('broadcasts conversation.read when a participant marks a message read', async () => {

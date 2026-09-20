@@ -149,11 +149,17 @@ export class MessagesService {
     });
   }
 
+  // Authorship alone is not enough: a sender who has since been blocked (in
+  // either direction), left, or whose conversation was deleted must not be
+  // able to rewrite or erase history the other side still sees. The
+  // conversation-access rule is the same one every other message action
+  // uses (ADR-006 §5/§10: one rule, never duplicated per action).
   private async assertOwnsMessage(userId: string, messageId: string): Promise<Message> {
     const message = await this.prisma.message.findUnique({ where: { id: messageId } });
     if (!message || message.deletedAt || message.senderId !== userId) {
       throw new ResourceNotFoundException();
     }
+    await this.access.assertCanAccessConversation(userId, message.conversationId);
     return message;
   }
 }
