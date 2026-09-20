@@ -1,11 +1,11 @@
 # AfriLink PostgreSQL Database Design
 
-**Status:** Database architecture approved for all modules below (identity, social/reference, content, feed, community, messaging, notification, media, moderation, admin/audit, search, integration). Every design decision this document depends on is resolved via ADR-001, ADR-002, and ADR-003 (`docs/10-decisions/decisions.md`) — identifier format, lifecycle conventions, feed/search persistence, message retention, reaction cardinality and taxonomy, and reference-data seed content. Two items remain intentionally open as product content, not architecture: business-identity tables (deferred, not required for Phase 1) and any country/interest/reaction list content beyond the approved starter seed. **Phase 1 database implementation is complete**: `database/schema.prisma` exists and is applied via the migration in `database/migrations/20260914000000_init_phase1/`, the local PostgreSQL dev database (Docker Compose) is operational, and Phase 1 reference data (`reference.countries`, `reference.interests`) is seeded and verified per ADR-003 §7. Phase 2 (communities, messaging, notifications, media, moderation, audit, feed, search — §25 step 3) has not yet been implemented/resumed.
-**Date:** 2026-09-13 (patched 2026-09-14 to add `social.friendships` and `content.shares`, approved MVP scope per `architecture.md` §7/§12 and ADR-002 §4 missing from the original draft; patched 2026-09-14 to add `reference.countries`/`reference.interests` and correct status claims that previously and incorrectly stated Phase 1 was implemented; patched 2026-09-14 on ADR-003 approval to resolve message retention, reaction cardinality, and reference-data seed content; patched 2026-09-14 on ADR-003 §8 approval to resolve the reaction type taxonomy; patched 2026-09-17 to correct status/progress wording after Phase 1 database implementation and the NestJS Phase 1 API were completed and verified — this document previously and incorrectly still described Phase 1 as not started)
+**Status:** Database architecture approved for all modules below (identity, social/reference, content, feed, community, messaging, notification, media, moderation, admin/audit, search, integration). Every design decision this document depends on is resolved via ADR-001, ADR-002, and ADR-003 (`docs/10-decisions/decisions.md`) — identifier format, lifecycle conventions, feed/search persistence, message retention, reaction cardinality and taxonomy, and reference-data seed content. Two items remain intentionally open as product content, not architecture: business-identity tables (deferred, not required for Phase 1) and any country/interest/reaction list content beyond the approved starter seed. **Phase 1 database implementation is complete**: `database/schema.prisma` exists and is applied via the migration in `database/migrations/20260914000000_init_phase1/`, the local PostgreSQL dev database (Docker Compose) is operational, and Phase 1 reference data (`reference.countries`, `reference.interests`) is seeded and verified per ADR-003 §7. **Database Phase 2 is in progress**: the Communities (`community`), Messaging (`messaging`) and Notifications (`notification`) schemas are implemented, migrated and verified on local development (migrations `20260918000000_add_communities`, `20260918010000_add_messaging`, `20260919000000_add_notifications`); each deliberately omits or adjusts some tables/columns described in its section below (see the "Implementation status" note in §8, §9 and §10). Media, moderation, audit, feed and search (§25 step 3) remain design-only and have not been started.
+**Date:** 2026-09-13 (patched 2026-09-14 to add `social.friendships` and `content.shares`, approved MVP scope per `architecture.md` §7/§12 and ADR-002 §4 missing from the original draft; patched 2026-09-14 to add `reference.countries`/`reference.interests` and correct status claims that previously and incorrectly stated Phase 1 was implemented; patched 2026-09-14 on ADR-003 approval to resolve message retention, reaction cardinality, and reference-data seed content; patched 2026-09-14 on ADR-003 §8 approval to resolve the reaction type taxonomy; patched 2026-09-17 to correct status/progress wording after Phase 1 database implementation and the NestJS Phase 1 API were completed and verified — this document previously and incorrectly still described Phase 1 as not started; patched 2026-09-19 to record that the Communities, Messaging and Notifications database layers are implemented and to document where the implementation deliberately adds, adjusts or defers relative to §8–§10)
 **Database:** PostgreSQL
-**ORM/migrations:** Prisma — Phase 1 schema and migration implemented under `database/schema.prisma` and `database/migrations/20260914000000_init_phase1/`; Phase 2 modules (communities, messaging, notifications, media, moderation, audit, feed, search) not yet implemented.
+**ORM/migrations:** Prisma — schema in `database/schema.prisma`; migrations in `database/migrations/`: `20260914000000_init_phase1` (Phase 1), then Database Phase 2 so far: `20260918000000_add_communities`, `20260918010000_add_messaging`, `20260919000000_add_notifications`. Not yet implemented: media, moderation, audit, feed, search.
 
-> PostgreSQL, Prisma, Redis, and the modular-monolith constraint are defined in `CLAUDE.md`. Product scope (`docs/01-product/PRD.md`) and architecture (`docs/03-architecture/architecture.md`, ADR-001, ADR-002) are approved. Phase 1 (identity, reference, social, content, integration) is implemented — `database/schema.prisma`, the applied migration, and the seed script all exist in the repository. Phase 2 modules (feed, community, messaging, notification, media, moderation, admin/audit, search) remain logical/physical design only — no ORM models or migrations exist for them yet.
+> PostgreSQL, Prisma, Redis, and the modular-monolith constraint are defined in `CLAUDE.md`. Product scope (`docs/01-product/PRD.md`) and architecture (`docs/03-architecture/architecture.md`, ADR-001, ADR-002) are approved. Phase 1 (identity, reference, social, content, integration) and the Database Phase 2 modules community, messaging and notification are implemented — `database/schema.prisma`, the applied migrations, and the seed script all exist in the repository. The remaining modules (feed, media, moderation, admin/audit, search) are logical/physical design only — no ORM models or migrations exist for them yet.
 
 ## 1. Database goals
 
@@ -307,6 +307,15 @@ Store inviter, invitee or token hash, community, expiry, acceptance/revocation s
 
 If community roles require more detail than membership roles, store scoped role assignments with grantor, expiry, and revocation. These records must never map directly to platform roles.
 
+**Implementation status (2026-09-19, migration `20260918000000_add_communities`):** `communities`, `memberships` and `invitations` are implemented. Where the implementation differs from the field lists above:
+
+- `community.moderator_assignments` is **deferred** — this section frames it as conditional ("if community roles require more detail than membership roles"), and `memberships.role` already gives an app-validated slot for "moderator".
+- `communities.status`, `communities.membership_policy` and `memberships.role` are **app-validated text, not enums**: this document names them without enumerating values (PRD §25 says role names still require confirmation). `communities.visibility` is an enum (`public`, `private`, PRD §24); `memberships.status` is the enum listed above.
+- "Unique active slug" and "unique active `(community_id, user_id)`" are **partial unique indexes** (`WHERE deleted_at IS NULL` / `WHERE status = 'active'`). Because only `active` is constrained, a user can hold more than one `pending` row for the same community.
+- `invitations` carry a CHECK preventing self-invites (`invitee_id` is nullable for link-based invites) and a unique `token_hash`.
+- `avatar_media_id` / `cover_media_id` are plain UUID columns with no foreign key until the `media` schema exists. `content.posts.community_id` now has its foreign key (`ON DELETE SET NULL`).
+- No Communities API exists yet (`api.md` §15).
+
 ## 9. Messaging schema
 
 ### `messaging.conversations`
@@ -338,6 +347,16 @@ Messages are append-oriented. `deleted_at` hides a message from participants imm
 - unique `(message_id, user_id)`;
 - use conversation-level read cursors for scale, with per-message receipts only if required by product behavior.
 
+**Implementation status (2026-09-19, migration `20260918010000_add_messaging`):** `conversations`, `participants` and `messages` are implemented. Where the implementation differs from the field lists above:
+
+- `conversations` gains `direct_participant_a_id` / `direct_participant_b_id` (not in the list above). With a `LEAST`/`GREATEST` partial unique index they make the database itself guarantee **at most one active direct conversation per unordered pair of users**, in either column order; CHECKs require `kind = 'direct'` and, for direct conversations, two set and distinct participants. Both columns reference `identity.users` with `ON DELETE RESTRICT` and are modeled as Prisma relations.
+- `participants` has a **composite primary key** `(conversation_id, user_id)` and no separate `id`, which is what enforces "unique active".
+- `messages.sender_id` is `ON DELETE RESTRICT`, unlike the cascade used elsewhere: a message belongs to both participants' history, so a sender's hard delete must not silently erase the other participant's conversation (ADR-003 §5). `moderation_state` is a messaging-owned enum (`active`, `hidden`, `removed`); `conversations.status`, `participants.role`/`status` and `messages.status` are app-validated text.
+- **Message requests are not a separate table** (`architecture.md` §14): they are `conversations.status` (the API uses `pending`, `accepted`, `declined`).
+- `messaging.message_receipts` is **deferred**: this section makes it conditional, and the conversation-level read cursor `participants.last_read_message_id` is implemented instead.
+- **Image attachments have no table or column yet** — blocked on the `media` schema, the same reason as `content.post_media`. Reporting relationships are deferred until the `moderation` schema exists. Blocking reuses `social.blocks`; no messaging-specific block table exists.
+- The Messaging REST API and WebSocket gateway are implemented (`api.md` §13, `docs/05-api/messaging-websocket.md`).
+
 ## 10. Notification schema
 
 ### `notification.notifications`
@@ -358,6 +377,16 @@ Store user, category, channel, enabled state, locale, quiet-hour configuration, 
 - `notification_id`, `channel`, provider, provider message ID, state, attempt count, next attempt time, delivered/failed timestamps, error category;
 - unique provider delivery key where available;
 - indexes for pending retry work and provider reconciliation.
+
+**Implementation status (2026-09-19, migration `20260919000000_add_notifications`):** `notifications` and `preferences` are implemented; **`notification.deliveries` is deferred** — it exists for push/email/SMS provider attempts, and those channels are still an open decision. Where the implementation differs from or interprets the design above:
+
+- `type`, `category` and `channel` are **app-validated text**: no approved document enumerates notification types or categories.
+- `target_type` / `target_id` are a polymorphic reference with **no foreign key**, and must be both set or both null (CHECK). `actor_user_id` is nullable (system notifications) and `ON DELETE SET NULL`; `recipient_user_id` is `ON DELETE CASCADE`. A CHECK prevents notifying a user of their own action.
+- The "deduplication key" is `dedup_key`, unique per recipient `(recipient_user_id, dedup_key)`; NULLs never collide, and soft-deleted rows still count so a replayed event cannot resurrect a dismissed notification.
+- `preferences` has a composite primary key `(user_id, category, channel)`. `enabled` has **no default** so a channel that needs consent is never implicitly on. `locale` and the quiet-hour columns are nullable per-row overrides; NULL means inherit from `social.user_preferences` / `identity.users`, so there is no second authoritative copy.
+- Indexes: the list index above, a partial unread index (`WHERE read_at IS NULL AND deleted_at IS NULL`), and an index on `deleted_at`.
+- **Retention is an open decision.** No notification retention period has been decided; the schema supplies only lifecycle hooks (`created_at`, `read_at`, `deleted_at`).
+- No Notifications API exists yet (`api.md` §15).
 
 ## 11. Media schema
 
@@ -532,6 +561,7 @@ Define retention periods with legal and product owners before production:
 - Audit events and moderation decisions follow a separate restricted retention schedule.
 - Media objects and variants are deleted asynchronously after all references are removed or anonymized.
 - Backups follow their own expiry and restoration privacy controls.
+- **Notifications:** the retention period for dismissed and aged-out `notification.notifications` rows is an **open decision**, not resolved by ADR-001 or ADR-003 (§10 above).
 
 Every destructive workflow must be idempotent, auditable, and resumable.
 
@@ -575,6 +605,7 @@ Partitioning requires migration rehearsals, compatible indexes, retention automa
 | Privacy/legal retention | Determines deletion and audit behavior | **Resolved:** ADR-001 (`docs/10-decisions/decisions.md`) — 30/90-day windows |
 | Reaction cardinality and taxonomy | Affects `post_reactions`/`comment_reactions` uniqueness and allowed values | **Resolved:** one active reaction per user per post/comment (ADR-003 §6) — unique `(user_id, post_id)` / `(user_id, comment_id)`; five allowed types — Like, Love, Laugh, Support, Insightful (ADR-003 §8) |
 | Message retention | High sensitivity and storage growth | **Resolved:** 90 days post-deletion, same window as general content under ADR-001 — no bespoke messaging tier (ADR-003 §5) |
+| Notification retention | Determines purge/expiry of `notification.notifications` rows | **Open — deferred by the owner.** No retention period selected; not covered by ADR-001/ADR-003 (§10, §20) |
 | Business identities | May require organization tables and permissions | Open — not required for the Phase 1 implementation slice |
 | Search strategy | Affects projections and indexes | **Resolved:** PostgreSQL full-text search first (ADR-003 §4); revisit only if language/relevance/latency evidence justifies a dedicated search engine |
 | Scale targets | Determines partitioning and replicas | **Partially resolved:** 99.5% availability, p95<500ms, ~10k/1k capacity targets approved (ADR-002); RPO/RTO and vendor/region deferred to infrastructure phase |
@@ -583,9 +614,9 @@ Partitioning requires migration rehearsals, compatible indexes, retention automa
 
 1. ~~Confirm PRD, identity policy, countries/languages, retention, and identifier format.~~ Resolved: PRD, ADR-001, ADR-002, ADR-003.
 2. Create the initial Prisma/PostgreSQL migration for identity, reference, social, content, and integration foundations.
-3. Add communities, messaging, notifications, media, moderation, audit, feed, and search projections incrementally. Messaging requires no further retention decision (ADR-003 §5) before it can be implemented.
+3. Add communities, messaging, notifications, media, moderation, audit, feed, and search projections incrementally. **Done:** communities, messaging and notifications (database layer). **Remaining:** media, moderation, audit, feed, search. Messaging required no further retention decision (ADR-003 §5); notifications still need one (open, §24).
 4. Add constraints and authorization-focused integration tests before feature breadth.
 5. Seed `reference.countries` and `reference.interests` with the ADR-003 §7 starter content, plus other representative seed data and query-performance fixtures.
 6. Validate backup/restore, migration rollback/forward-fix, outbox replay, deletion workflows, and privacy checks.
 
-This document's design is fully approved (PRD, ADR-001, ADR-002, ADR-003). Step 2 (Phase 1 Prisma schema and migration) is complete — see the Status line at the top of this document. Step 3 onward (communities, messaging, notifications, media, moderation, audit, feed, search) has not yet been started in this repository.
+This document's design is fully approved (PRD, ADR-001, ADR-002, ADR-003). Step 2 (Phase 1 Prisma schema and migration) is complete, and step 3 is in progress: the communities, messaging and notifications database layers are implemented — see the Status line at the top of this document. Media, moderation, audit, feed and search have not yet been started in this repository.

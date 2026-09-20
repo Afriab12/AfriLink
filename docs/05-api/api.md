@@ -1,11 +1,11 @@
 # AfriLink REST API Design
 
-**Status:** Architecture/design complete for Phase 1 (identity, profiles/social graph, content, reference data). Every endpoint below is explicitly marked **[Phase 1]** (implementable against the already-applied database migration) or **[Future contract]** (design-only, blocked on Database Phase 2 — see §15). No controllers, services, DTOs, or OpenAPI runtime have been generated; this is a contract design only.
-**Date:** 2026-09-13 (original draft); rewritten 2026-09-15 for API Architecture Phase — PRD/architecture/database are now approved and Phase 1 database (`identity`, `reference`, `social`, `content`, `integration` schemas) is implemented, migrated, and seeded. This revision corrects several inaccuracies the original draft had relative to the actual schema (see §16 database-consistency findings) and incorporates frontend-team transport decisions (§12).
+**Status:** The Phase 1 REST surface (identity, profiles/social graph, content, reference data) and the Messaging REST API + WebSocket gateway are implemented and covered by end-to-end tests; an OpenAPI document is generated from the live controllers (`/api/docs`, `/api/docs-json`, and a CI build artifact). Every endpoint below is marked **[Phase 1]** (implemented) or **[Future contract]** (not implemented — design only). Communities and Notifications now have database schemas (Database Phase 2) but no REST API yet; Feed, Media, Moderation, Admin/Audit and Search are still blocked on their database modules (see §15). The implemented Messaging routes are listed in §13.
+**Date:** 2026-09-13 (original draft); rewritten 2026-09-15 for API Architecture Phase — PRD/architecture/database are now approved and Phase 1 database (`identity`, `reference`, `social`, `content`, `integration` schemas) is implemented, migrated, and seeded. This revision corrects several inaccuracies the original draft had relative to the actual schema (see §16 database-consistency findings) and incorporates frontend-team transport decisions (§12). Patched 2026-09-19 to reflect that the Phase 1 REST surface and the Messaging REST/WebSocket surface are implemented, and that the Communities and Notifications database layers now exist (their APIs do not yet).
 **Base path:** `/api/v1`
-**Format:** JSON over HTTPS; WebSocket gateway reserved for future real-time delivery (messaging only — see §12)
+**Format:** JSON over HTTPS; WebSocket gateway for real-time messaging delivery (messaging only — implemented, see §13 and `docs/05-api/messaging-websocket.md`)
 
-> REST, OpenAPI, WebSockets, JWT access/refresh tokens, and the modular-monolith constraint are defined in `CLAUDE.md`. Endpoint scope reflects the approved `docs/01-product/PRD.md` and the actually-implemented Phase 1 database (`database/schema.prisma`, `docs/04-database/database.md`). New decisions this revision depends on (cookie/token specifics, CSRF, cursor pagination shape, WebSocket messaging boundary) are formalized in ADR-004 (`docs/10-decisions/decisions.md`), Proposed pending owner approval.
+> REST, OpenAPI, WebSockets, JWT access/refresh tokens, and the modular-monolith constraint are defined in `CLAUDE.md`. Endpoint scope reflects the approved `docs/01-product/PRD.md` and the actually-implemented Phase 1 database (`database/schema.prisma`, `docs/04-database/database.md`). New decisions this revision depends on (cookie/token specifics, CSRF, cursor pagination shape, WebSocket messaging boundary) are formalized in ADR-004 (`docs/10-decisions/decisions.md`), approved by the owner and implemented (status corrected 2026-09-19).
 
 ## 1. API architecture overview
 
@@ -29,9 +29,9 @@ flowchart LR
 | Friendships, follows, blocks | Social graph | `social` | **[Phase 1]** |
 | Posts, comments, reactions, shares | Content | `content` | **[Phase 1]** (text-only — see §16) |
 | Home/community feeds | Feed | `feed` (does not exist yet) | **[Future contract]** |
-| Communities | Communities | `community` (does not exist yet) | **[Future contract]** |
-| Messaging | Messaging | `messaging` (does not exist yet) | **[Future contract]** — WebSocket boundary defined now (§12) |
-| Notifications | Notifications | `notification` (does not exist yet) | **[Future contract]** — REST/polling only, decided now (§12) |
+| Communities | Communities | `community` (database implemented; no REST API yet) | **[Future contract]** — API not implemented |
+| Messaging | Messaging | `messaging` | **[Implemented]** — REST + WebSocket gateway (§13, ADR-006) |
+| Notifications | Notifications | `notification` (database implemented; no REST API yet) | **[Future contract]** — REST/polling only, decided (§13); API not implemented |
 | Media | Media | `media` (does not exist yet) | **[Future contract]** |
 | Moderation | Moderation | `moderation` (does not exist yet) | **[Future contract]** |
 | Admin | Admin & Audit | `admin`, `audit` (do not exist yet) | **[Future contract]** |
@@ -299,23 +299,40 @@ Require `Idempotency-Key` for: registration, follow/unfollow, friend-request sen
 
 **Reactions are a special case, not idempotency-key-based:** `PUT .../reaction` is naturally idempotent by HTTP semantics and by the database design itself — `content.post_reactions`/`comment_reactions` enforce exactly one row per `(user, target)` (ADR-003 §6), so repeating the same `PUT` just re-sets the same state. No idempotency key needed there; adding one would be unnecessary mechanism per §12's own "do not add unnecessary idempotency" instruction.
 
-## 13. WebSocket boundary (messaging — future contract, defined now)
+## 13. WebSocket boundary (messaging — implemented)
 
-Full detail in ADR-004 §6. Summary:
+Full detail in ADR-004 §6, ADR-006 and `docs/05-api/messaging-websocket.md`. Summary:
 
 - **REST is authoritative for writes** — sending a message is always `POST /conversations/{id}/messages`, never a WebSocket write.
-- **Auth:** same `afrilink_at` HttpOnly cookie, sent automatically on the WS handshake (same-origin Upgrade request); mobile authenticates via a post-connect auth frame.
+- **Auth:** same `afrilink_at` HttpOnly cookie, sent automatically on the WS handshake (same-origin Upgrade request) and verified by connection middleware before the connection completes; mobile passes the access token in the Socket.IO handshake `auth` payload (`accessToken`) — never in the URL or query string.
 - **Authorization:** per-conversation subscription check against `messaging.participants`, not just connection-level auth.
 - **Lifecycle:** connect → authenticate → subscribe → receive → heartbeat → reconnect-with-backoff on drop, re-authenticate, re-subscribe.
-- **Events:** `message.accepted`, `message.updated`, `message.deleted`, `conversation.read` — each with event ID, type, resource ID, version, server timestamp.
+- **Events:** `message.accepted`, `message.updated`, `message.deleted`, `conversation.read`, `conversation.updated` — emitted only after the corresponding REST write commits. Payloads carry the affected resource; the event ID/version envelope described in `architecture.md` §24 is not implemented yet. Client → server events are subscription management only: `conversation.join`, `conversation.leave` (namespace `/messaging`, rooms `conversation:{id}`).
 - **Acknowledgement:** via REST (`POST /conversations/{id}/read`), not a raw WS ack.
 - **Reconnect/recovery:** missed messages recovered via the same cursor-paginated REST endpoint (§9) — WS is best-effort for the live stream, REST is durable truth.
-- **Failure handling:** typed `error` event + specific close code on rejected auth/subscription; if WS is unavailable, reading still works via REST polling.
+- **Failure handling:** an unauthenticated or invalid-token connection is rejected at the handshake (`connect_error` with message `AUTHENTICATION_REQUIRED` or `TOKEN_INVALID`) before any event is accepted; a rejected `conversation.join` returns an acknowledgement `{ ok: false, error: { code, message } }` and leaves the connection open; if WebSocket is unavailable, reading still works via REST polling.
 - **Pagination:** message history uses the same cursor convention (§9), always over REST.
 
 **Notifications explicitly do NOT use WebSocket for MVP** — REST/polling only (`GET /notifications`, cursor-paginated, §15). The notification DTO shape is kept WS-event-compatible so a future push channel is additive, not a redesign — nothing built toward it now, and it is deliberately excluded from the WebSocket event list above (an earlier draft of this document had incorrectly included `notification.created` in the WS event set; ADR-004 §7 corrects that).
 
-Neither messaging nor notifications is implementable today — `messaging`/`notification` schemas don't exist in Phase 1 (§15).
+**Implementation status:** Messaging (REST + WebSocket gateway) is implemented; some designed WebSocket safeguards (token-expiry re-check, disconnect on logout, live block eviction, Origin check) are not yet built — see `docs/05-api/messaging-websocket.md` §14. Notifications have a database schema but no REST API yet.
+
+**Implemented Messaging REST routes** (all authenticated; state-changing routes also require the CSRF header, §4; errors and cursor pagination follow §6/§9):
+
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/conversations` | Start a direct conversation with `recipientUserId`. Idempotent per pair (returns the existing conversation). Starts `accepted` if the two users are accepted friends, otherwise `pending` (a message request). Rejects self and blocked users. |
+| `GET` | `/conversations` | List the caller's conversations, cursor-paginated, most recent message first (`last_message_at` descending, `id` descending as tie-breaker). Conversations with no messages yet come last, newest-created first. The cursor is opaque and specific to this ordering: cursors issued before this change (`created_at`-based) are rejected with `400 INVALID_CURSOR`; clients restart from the first page. |
+| `GET` | `/conversations/{id}` | One conversation (participants only; `404` otherwise). |
+| `POST` | `/conversations/{id}/accept` | The recipient accepts a `pending` request. |
+| `POST` | `/conversations/{id}/decline` | The recipient declines a `pending` request (`declined`; sending is then rejected). |
+| `POST` | `/conversations/{id}/messages` | Send `{ body, clientMessageId }`; idempotent on `clientMessageId`. While `pending`, only the initiator may send. |
+| `GET` | `/conversations/{id}/messages` | Message history, newest first, cursor-paginated. |
+| `PATCH` | `/messages/{id}` | Edit the caller's own message (sets `editedAt`). The caller must still have access to the conversation (an active participant, not blocked in either direction, conversation not deleted); otherwise `404`, indistinguishable from a nonexistent message. |
+| `DELETE` | `/messages/{id}` | Soft-delete the caller's own message, under the same access rule as edit (`404` if the caller no longer has access to the conversation). |
+| `POST` | `/conversations/{id}/read` | Advance the caller's read cursor with `{ messageId }`. |
+
+Request/response schemas are in the generated OpenAPI document.
 
 ## 14. Frontend handoff
 
@@ -331,18 +348,18 @@ Written for the separate frontend team building against this contract.
 - **Loading/empty/error states:** an empty collection is `data: [], hasMore: false` — not an error. A `404` on a single resource means "does not exist or you can't see it" (never disambiguated, by design — §13). A `403` means it exists but you're not permitted.
 - **Optimistic operations:** safe to optimistically apply follow/reaction/share toggles client-side (server enforces the real state regardless); post/comment creation should wait for the server response before showing as permanent, since content passes validation/policy checks that can reject it.
 - **Idempotency:** attach `Idempotency-Key` (any client-generated UUID) on retryable mutations listed in §12 before retrying a timed-out request — never retry those without one, to avoid duplicate posts/friend-requests/etc.
-- **WebSocket (future, messaging only):** not usable yet. When it ships, connection auth reuses your existing web session automatically (cookie-based) — no separate token handling needed on your side.
+- **WebSocket (messaging only):** available now on the `/messaging` namespace. On web, connection auth reuses your existing session cookie automatically — no separate token handling; mobile passes the access token in the Socket.IO handshake `auth` payload.
 
-## 15. Future API contracts
+## 15. Phase 2 API contracts (implemented and future)
 
-None of the modules below have a backing database schema in Phase 1 (verified directly against `database/schema.prisma` — §16). Each is a forward contract boundary only, not implementation-ready.
+Communities, Messaging and Notifications now have backing database schemas (Database Phase 2); Feed, Media, Moderation, Admin and Search do not (verified against `database/schema.prisma`). Only Messaging has an implemented API. Every other row is a forward contract boundary, not implemented.
 
 | Module | Planned transport | Primary resources | Auth/authz | Pagination | DB Phase 2 dependency | Status |
 |---|---|---|---|---|---|---|
 | Feed | REST | `/feed`, `/communities/{id}/feed` | Authenticated; visibility+block+moderation filtering at read time | Cursor (§9 convention) | `feed.entries` and ranking metadata — does not exist | **Future contract only.** Preserves the approved ranking concept (relationship + relevance + recency + basic engagement, `architecture.md` §13) as the design target once buildable. |
-| Communities | REST | `/communities`, memberships, invitations | Scoped community roles, separate from platform roles | Cursor for members/posts | `community.*` — does not exist | **Future contract only.** |
-| Messaging | WebSocket (delivery) + REST (writes/history) | `/conversations`, `/conversations/{id}/messages` | Per-conversation participant check | Cursor (§9); WS is not paginated | `messaging.*` — does not exist | **Future contract, boundary fully defined now (§13/ADR-004 §6)** per frontend team requirement, so it isn't retrofit later. |
-| Notifications | REST/polling only (no WS for MVP) | `/notifications`, `/notification-preferences` | Authenticated, recipient-only | Cursor (§9) | `notification.*` — does not exist | **Future contract only.** Transport decision (REST, not WS) is final for MVP per frontend team (§13/ADR-004 §7). |
+| Communities | REST | `/communities`, memberships, invitations | Scoped community roles, separate from platform roles | Cursor for members/posts | `community.*` — database implemented; no API yet | **Future contract only.** |
+| Messaging | WebSocket (delivery) + REST (writes/history) | `/conversations`, `/conversations/{id}/messages` | Per-conversation participant check | Cursor (§9); WS is not paginated | `messaging.*` — implemented | **Implemented** (§13, ADR-006). |
+| Notifications | REST/polling only (no WS for MVP) | `/notifications`, `/notification-preferences` | Authenticated, recipient-only | Cursor (§9) | `notification.*` — database implemented; no API yet | **Future contract only.** Transport decision (REST, not WS) is final for MVP per frontend team (§13/ADR-004 §7). |
 | Media | REST (signed upload flow) | `/media/uploads`, `/media/{id}` | Owner-authorized | N/A (single-resource reads) | `media.*` — does not exist. Note: `social.profiles.avatar_media_id` and would-be `content.post_media` exist only as unvalidated/absent columns — see §16 finding 1 | **Future contract only.** |
 | Moderation | REST | `/reports`, `/moderation/cases`, appeals | User-facing (own reports) vs. scoped moderator/admin | Cursor for queues | `moderation.*` — does not exist | **Future contract only.** |
 | Admin | REST | `/admin/*` | Platform role + MFA + audit | Offset (§9) | `admin.*`, `audit.*` — do not exist | **Future contract only.** |
@@ -354,7 +371,7 @@ Checked every Phase 1 endpoint above against the actual, applied `database/schem
 
 1. **`social.profiles.avatar_media_id` exists but is unusable safely today.** It's a bare nullable UUID column with **no foreign key** (deliberately — `media` schema doesn't exist yet, per `schema.prisma`'s own header comment). Nothing validates that a client-supplied UUID corresponds to a real, owned, ready, approved asset. Accepting it on `PATCH /me/profile` today would let a client set an arbitrary, meaningless UUID with no way to serve or verify it. **Decision: `avatarMediaId` is not an accepted field on any Phase 1 endpoint.** Dependency: the Media module (§15) must exist first.
 2. **Friendships were entirely absent from the original endpoint list**, despite `social.friendships` being fully implemented (pending/accepted/declined/removed lifecycle, unordered-pair uniqueness, self-request prevention — `database.md` §5, ADR-002 §4). Added the full friend-request/accept/decline/cancel/remove/list surface in §8.
-3. **Post creation previously accepted `mediaIds` and `communityId`**, but `content.post_media`/`comment_media` join tables don't exist in Phase 1 at all, and `content.posts.community_id` is a bare unvalidated UUID column (same shape as finding 1, dependency on the `community` schema). **Decision: Phase 1 posts are text-only; `communityId` is rejected until the Communities module exists.** No schema change proposed — this is a scope correction to the API design, not a database gap to fix.
+3. **Post creation previously accepted `mediaIds` and `communityId`**, but `content.post_media`/`comment_media` join tables don't exist in Phase 1 at all, and `content.posts.community_id` had no foreign key in Phase 1 (the foreign key to `community.communities` was added in Database Phase 2, but the Communities API does not exist yet). **Decision: Phase 1 posts are text-only; `communityId` is rejected until the Communities module exists.** No schema change proposed — this is a scope correction to the API design, not a database gap to fix.
 
 No missing constraints, ambiguous relationships, or concurrency risks were found for the Phase 1 surface itself — cardinality (one reaction per user per post, unordered-pair friendship uniqueness, self-relationship checks) is already enforced at the database layer (`database.md` §17), so the API layer doesn't need to re-implement those invariants, only surface the resulting `409`/`422` cleanly. One N+1 risk worth flagging for implementation time (not a design blocker): `GET /users/{userId}/relationship` composes three separate checks (follow/friendship/block) — implement as one batched query or three parallel indexed lookups, not three sequential round-trips.
 
@@ -375,22 +392,23 @@ No missing constraints, ambiguous relationships, or concurrency risks were found
 
 | Decision | Why it matters | Status |
 |---|---|---|
-| Auth cookie names/lifetimes/CSRF strategy | Security-critical, frontend-visible | **Proposed** — ADR-004 §1–4, pending owner approval |
-| Cursor pagination shape/page sizes | Every list endpoint depends on it | **Proposed** — ADR-004 §5, pending owner approval |
-| Messaging WebSocket boundary | Frontend needs it now despite no DB backing yet | **Proposed** — ADR-004 §6, pending owner approval |
-| Notifications REST-only for MVP | Frontend-confirmed, corrects an earlier draft inconsistency | **Proposed** — ADR-004 §7, pending owner approval |
+| Auth cookie names/lifetimes/CSRF strategy | Security-critical, frontend-visible | **Approved** — ADR-004 §1–4, implemented |
+| Cursor pagination shape/page sizes | Every list endpoint depends on it | **Approved** — ADR-004 §5, implemented |
+| Messaging WebSocket boundary | Frontend transport requirement (implemented — ADR-006) | **Approved** — ADR-004 §6, implemented (ADR-006) |
+| Notifications REST-only for MVP | Frontend-confirmed, corrects an earlier draft inconsistency | **Approved** — ADR-004 §7 |
 | Error contract multi-field support | Frontend form-mapping depends on it | **Resolved** — existing `details` array shape confirmed sufficient, ADR-004 §8 |
 | Mobile client-type detection mechanism | Needed before mobile auth is implementable | Open — implementation detail, not an architecture blocker |
 | Rate-limit exact thresholds (§11) | Tunable without a design change | Open — illustrative starting values given; production tuning deferred |
 | Audit trail for auth/authz failures | Security observability | Open — blocked on `audit` schema (Database Phase 2), not an API design gap |
-| Feed/Communities/Messaging/Notifications/Media/Moderation/Admin/Search implementation | All of §15 | Open — blocked on Database Phase 2, contracts defined so implementation won't retrofit badly |
+| Communities/Notifications API implementation | Database layers exist; no REST API yet | Open — contracts to be finalized before implementation |
+| Feed/Media/Moderation/Admin/Search implementation | All remaining §15 rows | Open — blocked on their Database Phase 2 modules, contracts defined so implementation won't retrofit badly |
 
 ## 19. Recommended order after approval
 
-1. Approve ADR-004 (cookies/CSRF, pagination, WebSocket boundary, notifications-REST-only).
+1. ~~Approve ADR-004 (cookies/CSRF, pagination, WebSocket boundary, notifications-REST-only).~~ Done — ADR-004 is approved and implemented.
 2. Implement Phase 1 REST surface (§8) against the already-applied database migration — auth first, then profiles/social graph, then content.
 3. Implement authorization and error/pagination middleware before feature endpoints (shared infrastructure first).
 4. Publish an OpenAPI document generated from reviewed DTOs once controllers exist — not before.
-5. Resume Database Phase 2 (communities/messaging/notifications/media/moderation/audit/feed/search per `database.md` §25) in whatever order product priority dictates; each unlocks its corresponding §15 contract without redesigning this document, since the boundaries are already defined.
+5. Continue Database Phase 2 (media, moderation, audit, feed, search per `database.md` §25 remain; the communities, messaging and notifications database layers are done) in whatever order product priority dictates; each unlocks its corresponding §15 contract without redesigning this document, since the boundaries are already defined.
 
-No endpoint implementation should begin until ADR-004 is approved.
+~~No endpoint implementation should begin until ADR-004 is approved.~~ Satisfied — ADR-004 is approved.

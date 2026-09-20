@@ -89,7 +89,7 @@ At the approved ~10,000 registered / ~1,000 concurrent target, a single NestJS p
 
 ## 15. Open decisions (not blocking this ADR, flagged for implementation time)
 
-- Exact mobile post-connect auth-frame shape (event name/payload) — implementation detail, not an architecture blocker, same category ADR-004 §4 already left open for REST mobile auth.
+- Exact mobile post-connect auth-frame shape (event name/payload) — implementation detail, not an architecture blocker, same category ADR-004 §4 already left open for REST mobile auth. **Resolved at implementation:** no post-connect frame exists; mobile passes `auth: { accessToken }` in the Socket.IO handshake and connection middleware validates it (see `messaging-websocket.md`).
 - Exact WS error/close-code taxonomy (beyond "typed `error` event before close," already decided) — implementation detail.
 - Whether `user:{userId}` room is needed at MVP launch or can be added later (currently included for forward-compatibility with cross-device read sync, not exercised by any MVP event above) — flagged as a judgment call in `messaging-websocket.md` §6.
 

@@ -1,11 +1,11 @@
 # AfriLink Messaging WebSocket Architecture
 
-**Status:** DESIGN APPROVED — IMPLEMENTATION NOT YET AUTHORIZED
-**Date:** 2026-09-18
+**Status:** DESIGN APPROVED — IMPLEMENTED IN PART. Authentication, room authorization and event broadcasting are built and tested; several safeguards described below are designed but **not yet implemented** — see §14 for the exact state.
+**Date:** 2026-09-18 (design); updated 2026-09-19 and 2026-09-20 to record what was actually implemented
 **Formalized by:** ADR-006 (`docs/10-decisions/ADR-006-messaging-websocket.md`)
 **Builds on, does not redesign:** `architecture.md` §14/§24, `api.md` §12/§13, ADR-004 §6/§7 (`docs/10-decisions/decisions.md`), the applied `messaging` database schema (`database.md` §9, `schema.prisma`)
 
-> This document is architecture only. No package has been installed, no `MessagingGateway`/`MessagingController`/`MessagingService` has been written, no `package.json` has been modified, no database or frontend change has been made as part of producing it. Every code snippet below is illustrative of the *shape* of the future contract, not implementation.
+> The sections below describe the approved design. Where the implementation differs, or a described safeguard is not yet built, the passage is marked *(implemented)*, *(differs from design)* or *(designed — not yet implemented)*, and §14 summarizes the state of every area.
 
 ---
 
@@ -57,16 +57,16 @@ The WebSocket handshake is a plain HTTP `Upgrade` request to the same origin —
 ### Handshake authentication
 
 1. Client calls `io('/messaging', { withCredentials: true })` (or platform equivalent) against the same origin/API host already used for REST.
-2. The `Upgrade` request carries the `afrilink_at` cookie automatically (browser) or, for mobile (no shared cookie jar), the client sends a post-connect auth frame (`connection.authenticate`, carrying the access token in the payload — never a query string, never the URL) immediately after the socket opens, before any other event is accepted.
-3. A NestJS `WsAuthGuard` (or gateway-level `handleConnection` hook — implementation detail, not decided here) parses the cookie/auth-frame token, verifies it with the same `JwtService`/`JWT_ACCESS_SECRET` the existing `JwtAuthGuard` already uses (`services/api/src/common/guards/jwt-auth.guard.ts`) — no separate secret, no separate verification path.
-4. On success, the verified `{ sub, sid }` payload (identical shape to `AccessTokenPayload`) is attached to the socket's connection context (e.g. `socket.data.user`), exactly mirroring how `JwtAuthGuard` attaches `request.user` today.
+2. The `Upgrade` request carries the `afrilink_at` cookie automatically (browser). Mobile (no shared cookie jar) passes the access token in Socket.IO's handshake `auth` payload — `io(url, { auth: { accessToken } })` — which is sent as part of the initial handshake, never in a query string or the URL. If both are present, the cookie is used. *(differs from design: the design called for a separate post-connect `connection.authenticate` frame. No such event exists — the handshake `auth` payload is Socket.IO's native mechanism for this, and it means authentication completes before the connection does.)*
+3. Authentication runs as **Socket.IO connection middleware** — `server.use(...)`, registered in the gateway's `afterInit` hook. It reads the cookie (with a small hand-written parser, because Socket.IO's handshake bypasses Express's `cookie-parser`) or the handshake `auth` token, and verifies it with the same `JwtService`/`JWT_ACCESS_SECRET` the existing `JwtAuthGuard` uses — no separate secret, no separate verification path. *(implemented)* It is deliberately **not** the `handleConnection` hook: Socket.IO completes the transport handshake, and the client receives `connect`, *before* that hook runs, so rejecting there lets an unauthenticated client briefly appear connected. This was found and fixed during implementation and is covered by a regression test.
+4. On success, the verified `{ sub, sid }` payload (identical shape to `AccessTokenPayload`) is attached to the socket's connection context (e.g. `socket.data.user`), exactly mirroring how `JwtAuthGuard` attaches `request.user` today. *(implemented)*
 5. On failure, the connection is rejected before any event handler runs (§3 "authentication failure behavior" below) — never silently allowed through with an unauthenticated context.
 
 ### Access-token expiration
 
 The access token is short-lived (15 minutes, unchanged) but a WebSocket connection can live far longer than that. Two things happen independently:
 - The socket connection itself is **not** torn down the instant the token's `exp` passes — Socket.IO connections aren't re-validated per-millisecond.
-- Every **authorization-sensitive action** (joining a new conversation room) re-verifies the token's current validity at that moment, not just at initial handshake time — matching the existing codebase's "re-checked at read/action time" pattern (`PostAccessService`, `ProfileVisibilityService`). A room join attempted after the access token has expired fails with the same `TOKEN_EXPIRED`-equivalent WS error the REST layer already returns.
+- *(designed — not yet implemented)* Every **authorization-sensitive action** (joining a new conversation room) would re-verify the token's current validity at that moment, not just at handshake time. **As built, the token is verified once, when the connection is established.** `conversation.join` re-checks conversation membership and blocks (via `MessagingAccessService`) but not token expiry, so an established socket remains authorized after its 15-minute access token expires, until it disconnects.
 
 ### Reconnect after refresh
 
@@ -74,23 +74,23 @@ Refreshing (`POST /api/v1/auth/refresh`) issues a new `afrilink_at` cookie via R
 
 ### Logout behavior
 
-`POST /api/v1/auth/logout` revokes the current session and clears cookies (unchanged, existing behavior). The WebSocket connection tied to that session must then be forcibly closed server-side — the gateway needs a way to map `sessionId (sid)` → active socket(s) so logout can reach in and disconnect them, rather than leaving a socket alive with a now-revoked session. (This mapping is an implementation detail for the eventual `MessagingGateway`, not designed further here — flagged so it isn't forgotten, not solved now.)
+`POST /api/v1/auth/logout` revokes the current session and clears cookies (unchanged, existing behavior). The WebSocket connection tied to that session must then be forcibly closed server-side — the gateway needs a way to map `sessionId (sid)` → active socket(s) so logout can reach in and disconnect them, rather than leaving a socket alive with a now-revoked session. (This mapping is an implementation detail for the eventual `MessagingGateway`, not designed further here — flagged so it isn't forgotten, not solved now.) *(designed — not yet implemented.)* **As built, nothing links a socket to a session:** logging out does not disconnect an open socket, and it stays authorized until it disconnects. (For comparison, REST honors a revoked session's access token only until it expires — at most 15 minutes — because `JwtAuthGuard` also verifies only the JWT.)
 
 ### Revoked-session behavior
 
-Identical to logout's mechanism: refresh-token reuse detection (ADR-004 §3) revokes *all* sessions for a user — every open socket tied to any of those sessions must be disconnected the same way, with a typed `error` event (`SESSION_REVOKED`) sent immediately before the close, so the client can distinguish "you were logged out elsewhere" from a generic network drop.
+Identical to logout's mechanism: refresh-token reuse detection (ADR-004 §3) revokes *all* sessions for a user — every open socket tied to any of those sessions must be disconnected the same way, with a typed `error` event (`SESSION_REVOKED`) sent immediately before the close, so the client can distinguish "you were logged out elsewhere" from a generic network drop. *(designed — not yet implemented; same gap as logout above.)*
 
 ### Blocked-user behavior
 
-Blocking is not itself a connection-level event — a blocked user's *existing* socket connection stays open (they can still use the rest of the app), but every conversation-scoped authorization check (room join, and by extension every event scoped to that room) re-verifies via `social.blocks` at the moment of the action, per §10 below. A block that happens while both users are actively connected to the same conversation room results in the blocked party being evicted from that specific room (not disconnected entirely) the next time a room-scoped authorization re-check runs.
+Blocking is not itself a connection-level event — a blocked user's *existing* socket connection stays open (they can still use the rest of the app), but every conversation-scoped authorization check (room join, and by extension every event scoped to that room) re-verifies via `social.blocks` at the moment of the action, per §10 below. A block that happens while both users are actively connected to the same conversation room results in the blocked party being evicted from that specific room (not disconnected entirely) the next time a room-scoped authorization re-check runs. *(partly implemented.)* The block check runs when a room is joined. **Not implemented:** evicting an already-joined blocked party — sockets already in the room keep receiving broadcasts. New messages are still stopped, because sending is REST and is rejected once either user blocks the other; but editing or deleting an existing message (`PATCH`/`DELETE /messages/{id}`) checks only that the caller is the sender, not conversation membership or blocks, and still broadcasts into the room.
 
 ### Authentication failure behavior
 
-Handshake-time failure (missing/invalid/expired token, no valid auth frame from a mobile client within a short grace window): the connection is rejected at the transport level — Socket.IO's `handleConnection` throws/emits a connection error, the client never reaches a fully "connected" state, matching REST's `401 AUTHENTICATION_REQUIRED`/`TOKEN_INVALID`/`TOKEN_EXPIRED` semantics translated to the WS layer.
+Handshake-time failure: the connection is rejected by the connection middleware before it completes, so the client receives Socket.IO's `connect_error` and never a `connect`. The error `message` is `AUTHENTICATION_REQUIRED` (no credential presented) or `TOKEN_INVALID` (unverifiable or expired token — expiry is not distinguished as `TOKEN_EXPIRED`). *(implemented, with regression tests asserting `connect_error` rather than a later failure.)* There is no post-connect grace window, because there is no post-connect auth frame.
 
 ### Unauthorized-event behavior
 
-Post-handshake, a request for an action the (now-authenticated) user isn't permitted to do (e.g. `conversation.join` for a conversation they're not an active participant in) does **not** close the connection — it emits a typed `error` event scoped to that one request (§7), and the connection stays open for legitimate future actions. Only auth-level failures (expired session, revoked session, malformed frames past a strike threshold — §11) close the connection itself.
+Post-handshake, a request the authenticated user is not permitted to make (e.g. `conversation.join` for a conversation they are not an active participant in) does **not** close the connection. *(differs from design)* The failure is returned in the request's **acknowledgement**, `{ ok: false, error: { code, message } }` (`RESOURCE_NOT_FOUND`, `VALIDATION_FAILED`, `AUTHENTICATION_REQUIRED`), rather than as a separate `error` event. The `error` event is emitted only immediately before the server closes a socket that exceeded the invalid-request threshold (`TOO_MANY_INVALID_REQUESTS`; 20 malformed `conversation.join` requests per connection). Expired or revoked sessions do not close an established connection (see above).
 
 ---
 
@@ -102,9 +102,9 @@ Nothing here weakens or duplicates the existing HTTP cookie model — the WebSoc
 - **Secure:** `true` in production/staging, unchanged — WebSocket handshakes happen over `wss://` in any environment where the cookie itself is marked `Secure`, matching the existing REST cookie policy (browsers refuse to send a `Secure` cookie over an insecure `ws://` origin anyway, so this is enforced by the platform, not something to configure separately).
 - **Allowed origins:** the WS handshake's `Origin` header is validated against the exact same allow-list `main.ts`'s `app.enableCors({ origin: process.env.FRONTEND_ORIGIN ?? true, credentials: true })` already uses — one origin policy, not two.
 - **Credential handling:** `credentials: true` on both the REST CORS config and the Socket.IO CORS config (`cors: { origin: <same allow-list>, credentials: true }`) — required for the cookie to be sent on the handshake at all.
-- **WebSocket handshake origin validation:** rejected origins fail the handshake outright (same posture as a rejected CORS preflight today), before any authentication check even runs.
+- **WebSocket handshake origin validation:** rejected origins fail the handshake outright (same posture as a rejected CORS preflight today), before any authentication check even runs. *(designed — not yet implemented.)* The gateway sets Socket.IO's `cors` option (same allow-list as REST), but there is no explicit Origin check (`allowRequest`) on the WebSocket upgrade; cross-site protection currently rests on the `SameSite=Lax` cookie policy (ADR-004 §1).
 - **Relationship to CSRF:** CSRF (ADR-004 §2) exists specifically to stop a cross-site page from triggering a state-changing *REST* request using the browser's ambient cookies. A WebSocket connection is not itself a state-changing write — per ADR-004 §6 (unchanged by this document), **sending a message is always REST**, so it goes through the exact same `CsrfGuard` double-submit check it already does today. The WS layer therefore does not need its own CSRF mechanism — it inherits the guarantee from the fact that it never performs writes.
-- **No token in `localStorage`, no token in a URL/query string, ever** — the mobile post-connect auth frame (§3) carries the access token in the socket message payload after the connection is already established over `wss://` (TLS), the same trust boundary the REST response body already relies on for mobile token delivery (ADR-004 §4) — not a new, weaker channel.
+- **No token in `localStorage`, no token in a URL/query string, ever** — the mobile handshake `auth` payload (§3) carries the access token inside the Socket.IO handshake, over `wss://` (TLS), the same trust boundary the REST response body already relies on for mobile token delivery (ADR-004 §4) — not a new, weaker channel.
 
 ---
 
@@ -137,13 +137,13 @@ None of these classes exist yet — this is the target shape for whenever implem
 - **Room `conversation:{conversationId}`:** joined only after `MessagingAccessService` confirms the connecting user has an active (`left_at IS NULL`) row in `messaging.participants` for that conversation — the same check the REST history endpoint will perform, not a separate rule.
 - **Room `user:{userId}`:** joined automatically on connect (no authorization check needed — a user always may subscribe to their own account-level room). Reserved for **future** cross-device/account-level events (e.g. "you read this conversation on another device"); **no MVP event in §7 uses it yet** — flagged explicitly as a judgment call: included for forward-compatibility (so adding a cross-device-sync event later is additive, matching how the notification DTO shape was kept WS-compatible without building push — ADR-004 §7), not because an approved MVP requirement needs it today. If you'd rather it not exist until a concrete event needs it, that's a one-line removal from this design, not a redesign.
 
-**Join sequence:** `conversation.join` request (§7) → `MessagingAccessService.assertCanAccessConversation(userId, conversationId)` (re-checks active participant row + not blocked by the other participant, via `social.blocks`, same table REST will use) → on success, `socket.join('conversation:' + conversationId)` and an ack; on failure, a typed `error` event, no room membership change, connection stays open.
+**Join sequence:** `conversation.join` request (§7) → `MessagingAccessService.assertCanAccessConversation(userId, conversationId)` (re-checks active participant row + not blocked by the other participant, via `social.blocks`, same table REST will use) → on success, `socket.join('conversation:' + conversationId)` and an ack; on failure, an acknowledgement `{ ok: false, error }`, no room membership change, connection stays open.
 
 **Leave sequence:** explicit `conversation.leave` request, or automatic on disconnect (Socket.IO tracks room membership per-socket and cleans it up on disconnect without extra code) — leaving a room is never itself a durable action (it does not set `participants.left_at`; that's a REST-only mutation, matching "REST is authoritative for writes").
 
-**Blocked users:** handled entirely through the join-time (and re-checked) authorization call above — a block that lands while a room is already joined evicts the blocked party from that room on the next re-check (§3 "blocked-user behavior"), it does not need a bespoke "kick" event separate from the authorization re-check mechanism.
+**Blocked users:** handled entirely through the join-time (and re-checked) authorization call above — a block that lands while a room is already joined evicts the blocked party from that room on the next re-check (§3 "blocked-user behavior"), it does not need a bespoke "kick" event separate from the authorization re-check mechanism. *(partly implemented: the check runs at join time; evicting an already-joined blocked party is not implemented — see §3 and §14.)*
 
-**Deleted/invalid conversations:** a `conversation.join` for a `deletedAt`-set or nonexistent conversation ID fails authorization the same way an unauthorized one does (`RESOURCE_NOT_FOUND`-equivalent `error` event) — no distinct code path, matching the existing REST convention (`ResourceNotFoundException`) of not distinguishing "doesn't exist" from "you can't see it," to avoid enumeration.
+**Deleted/invalid conversations:** a `conversation.join` for a `deletedAt`-set or nonexistent conversation ID fails authorization the same way an unauthorized one does (an acknowledgement error with code `RESOURCE_NOT_FOUND`) — no distinct code path, matching the existing REST convention (`ResourceNotFoundException`) of not distinguishing "doesn't exist" from "you can't see it," to avoid enumeration.
 
 ---
 
@@ -196,13 +196,13 @@ Reconciled directly against ADR-004 §6's already-approved names — not reinven
 |---|---|
 | Purpose | An existing message was edited (`edited_at` set) |
 | Payload | `{ id, conversationId, body, editedAt }` |
-| Everything else | Same shape as `message.accepted` — emitted after the (future) REST edit endpoint commits |
+| Everything else | Same shape as `message.accepted` — emitted after `PATCH /messages/{id}` commits *(implemented)* |
 
 | Event | `message.deleted` |
 |---|---|
 | Purpose | An existing message was soft-deleted (`deleted_at` set) |
 | Payload | `{ id, conversationId, deletedAt }` — body is never re-sent, matching "hides a message from participants immediately" (database.md §9) |
-| Everything else | Emitted after the (future) REST delete endpoint commits |
+| Everything else | Emitted after `DELETE /messages/{id}` commits *(implemented)* |
 
 | Event | `conversation.read` |
 |---|---|
@@ -213,14 +213,14 @@ Reconciled directly against ADR-004 §6's already-approved names — not reinven
 | Event | `conversation.updated` |
 |---|---|
 | Purpose | Conversation-level metadata changed — the request→accepted `status` transition, or a future `title` change |
-| Payload | `{ id, status, title }` (only changed fields need be present) |
-| Everything else | Emitted after the relevant REST mutation commits |
+| Payload | `{ id, status }` *(as built; `title` is not a changeable field yet)* |
+| Everything else | Emitted after `POST /conversations/{id}/accept` or `/decline` commits *(implemented; no dedicated test yet)* |
 
 | Event | `error` |
 |---|---|
-| Purpose | A client request (§ client→server events) failed |
+| Purpose | *(differs from design)* Sent only immediately before the server closes a socket that exceeded the invalid-request threshold; ordinary request failures are returned in the request's acknowledgement (§3) |
 | Payload | `{ code, message }` — same canonical vocabulary as the REST error envelope's `code` field (`AUTHENTICATION_REQUIRED`, `RESOURCE_NOT_FOUND`, etc.), not a second error taxonomy |
-| Everything else | Scoped to the one failed request; does not close the connection (§3) unless the failure is itself an auth-level one |
+| Everything else | The connection is closed after this event is sent |
 
 ---
 
@@ -260,11 +260,12 @@ One shared decision point (`MessagingAccessService`, §5), consulted identically
 
 | Action | Rule |
 |---|---|
-| Opening a conversation (REST, future) | Active `messaging.participants` row for the requesting user |
-| Joining a conversation room (WS) | Same check, re-verified at join time — not inherited from connection-time auth alone |
+| Opening a conversation (REST) | Active `messaging.participants` row for the requesting user |
+| Joining a conversation room (WS) | The same participant-and-block check, run at join time. *(The access token itself is not re-verified at join — see §3.)* |
 | Sending a message (REST only — never WS) | Active participant row + conversation not `deletedAt` + (for a still-`pending` conversation) sender-side message-request rules per PRD §19 (a first message from a non-connection is a request until accepted — enforced by the already-applied `conversations.status` field) |
 | Reading message history (REST) | Active participant row |
 | Marking read (REST only — never WS) | Active participant row; a user can only advance their own `last_read_message_id`, never another participant's |
+| Editing / deleting a message (REST) | Sender-only ownership **and** the same participant/block check as every other message action (`assertOwnsMessage` calls `MessagingAccessService`). *(Fixed 2026-09-20 — see §14.)* |
 | All of the above | Re-checked against `social.blocks` (existing table, not duplicated or redesigned) — a block between the two participants suppresses all of the above the same way it already suppresses posts/comments/reactions/shares today |
 
 Friendship/follow relationship rules govern **conversation creation** specifically (who may initiate a request vs. send directly to an existing connection) — that logic lives entirely in the future REST `POST /conversations` handler; the WebSocket layer never creates conversations, so it has no independent copy of this rule to keep in sync.
@@ -277,9 +278,9 @@ No new dependency. Message *sending* is REST (§7) and therefore already covered
 
 New WS-specific surface, using the same in-memory per-key approach `RateLimitGuard` already implements (not a new package):
 
-- **Connection attempts:** throttle handshake attempts per IP (mirrors the existing guard's key shape, applied in `handleConnection` rather than as an HTTP route decorator).
-- **Room joins (`conversation.join`):** throttle per user — a burst of join attempts across many conversation IDs is a plausible enumeration/abuse pattern worth capping even though each individual check is cheap.
-- **Repeated invalid events:** a strike counter per connection — a socket that repeatedly sends malformed or unauthorized requests is disconnected after a threshold, rather than being allowed to hammer the authorization/validation path indefinitely. This is the one case where a non-auth failure *does* close the connection (§3), specifically to bound abuse, not because any single failure is itself fatal.
+- **Connection attempts:** throttle handshake attempts per IP (mirrors the existing guard's key shape, applied in `handleConnection` rather than as an HTTP route decorator). *(designed — not yet implemented.)*
+- **Room joins (`conversation.join`):** throttle per user — a burst of join attempts across many conversation IDs is a plausible enumeration/abuse pattern worth capping even though each individual check is cheap. *(designed — not yet implemented.)*
+- **Repeated invalid events:** a strike counter per connection — a socket that repeatedly sends malformed or unauthorized requests is disconnected after a threshold, rather than being allowed to hammer the authorization/validation path indefinitely. This is the one case where a non-auth failure *does* close the connection (§3), specifically to bound abuse, not because any single failure is itself fatal. *(implemented for malformed `conversation.join` requests: 20 per connection, then an `error` event and disconnect.)*
 
 ---
 
@@ -298,24 +299,38 @@ None of steps 1–3 are implemented, configured, or depended upon by this docume
 
 ## 13. Dependency gate
 
-See ADR-006 §13 for the authoritative table (this document mirrors it): `@nestjs/websockets@12.0.3`, `@nestjs/platform-socket.io@12.0.3`, `socket.io@4.8.3` (all runtime, required), `socket.io-client@4.8.3` (dev, optional — only if backend e2e tests exercise the gateway directly). **Nothing installed as part of this document.**
+See ADR-006 §13 for the authoritative table (this document mirrors it): `@nestjs/websockets@12.0.3`, `@nestjs/platform-socket.io@12.0.3`, `socket.io@4.8.3` (all runtime, required), `socket.io-client@4.8.3` (dev, optional — only if backend e2e tests exercise the gateway directly). **Installed with the implementation, at exactly these versions.**
 
 ---
 
-## 14. Summary status table
+## 14. Implementation status (updated 2026-09-20)
 
-| Area | Status |
-|---|---|
-| Transport (Socket.IO) | DESIGN APPROVED |
-| NestJS 12.0.3 compatibility | Verified, no conflicts |
-| Authentication (cookie-reuse handshake) | DESIGN APPROVED |
-| Cookie/CORS security | DESIGN APPROVED — no weakening of the existing model |
-| Process placement (same process) | DESIGN APPROVED |
-| Socket organization | DESIGN APPROVED (`user:{userId}` room flagged as forward-compatibility, not MVP-required) |
-| Event contract | DESIGN APPROVED — reconciled against ADR-004 §6, `message.send`/WS `message.read` explicitly excluded |
-| Delivery model | DESIGN APPROVED — best-effort live delivery only, REST remains source of truth |
-| Pagination boundary | DESIGN APPROVED — unchanged from ADR-004 §5/§6 |
-| Authorization | DESIGN APPROVED — single shared service, not duplicated |
-| Rate limiting | DESIGN APPROVED — reuses existing pattern, no new dependency |
-| Scaling | Single process sufficient now; future path described, not built |
-| **Implementation** | **NOT YET AUTHORIZED** — no gateway, controller, service, DTO, or package exists |
+| Area | Design | State |
+|---|---|---|
+| Transport: Socket.IO on NestJS 12.0.3 | Approved | **Implemented** (`@nestjs/websockets` / `@nestjs/platform-socket.io` 12.0.3, `socket.io` 4.8.3) |
+| Handshake authentication (cookie) | Approved | **Implemented** as connection middleware (`server.use()` in `afterInit`); regression-tested (`connect_error`, not a later failure) |
+| Mobile authentication | Post-connect auth frame | **Differs from design:** Socket.IO handshake `auth: { accessToken }`; no post-connect event exists |
+| Auth failure at the handshake | Rejected before connect | **Implemented:** `connect_error` = `AUTHENTICATION_REQUIRED` / `TOKEN_INVALID` |
+| Namespace and rooms | `/messaging`, `conversation:{id}`, `user:{id}` | **Implemented**; `user:{id}` is joined on connect, no event uses it yet |
+| Room join/leave authorization | Participant + block check | **Implemented** via the shared `MessagingAccessService`; tested (participant, non-participant, blocked, leave) |
+| Live events | `message.accepted`/`updated`/`deleted`, `conversation.read`/`updated` | **Implemented**, emitted after the REST write commits; the first four are tested, `conversation.updated` has no dedicated test yet |
+| Event envelope (event ID, version, timestamp) | `architecture.md` §24 | **Not implemented** — the payload is the affected resource |
+| Request failures | Typed `error` event | **Differs from design:** returned in the request's acknowledgement |
+| Token-expiry re-check at join | Approved | **Not implemented** |
+| Disconnect on logout / session revocation | Approved | **Not implemented** (no socket↔session link) |
+| Evict a blocked or departed participant from a joined room | Approved | **Not implemented — confirmed by probe (2026-09-19), tracked as F-1 below** |
+| Access check on message edit/delete | Implied by §10 | **Implemented** (fixed 2026-09-20): `assertOwnsMessage` now also calls `MessagingAccessService.assertCanAccessConversation`; regression-tested for blocked-either-way, left, and soft-deleted conversations, and that a rejected edit/delete is not broadcast |
+| Origin validation on the WebSocket upgrade | Approved | **Not implemented** (Socket.IO `cors` option only) |
+| Throttling of connection attempts and room joins | Approved | **Not implemented** |
+| Invalid-request strike counter | Approved | **Implemented** for malformed `conversation.join` (20, then `error` + disconnect) |
+| Scaling | Single process | As designed; no Redis adapter or sticky sessions |
+
+Rows marked **Not implemented** or **Gap** are open follow-up work, not changes to the approved design.
+
+### Tracked follow-ups
+
+**F-1 — Evict sockets from `conversation:{id}` when a participant is blocked or leaves (open, not scheduled).**
+Probe result (2026-09-19, throwaway test, not committed): a socket that has joined a room **stays a member** after the user is blocked or after their `participants.left_at` is set; nothing removes it.
+- **After a block — latent.** Nothing reaches the blocked socket today, because every REST action by either party is rejected (bidirectional block) before it emits. It would leak as soon as any event source not gated on the block exists.
+- **After `left_at` — real leak.** The remaining participant can still send, and the departed user's already-joined socket **receives `message.accepted`**. No REST leave/remove endpoint exists yet, so this is not reachable through the API today; it becomes live when leave, removal or conversation soft-delete is added.
+- **Fix direction (not designed here):** on block, leave and conversation deletion, remove that user's sockets from the room server-side (`socketsLeave`), and re-check access before emitting. Needs its own test-first change; also relates to the "Disconnect on logout" and token-expiry rows above.

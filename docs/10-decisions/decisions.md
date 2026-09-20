@@ -230,7 +230,7 @@ These decisions are reflected in `docs/04-database/database.md` §3 (conventions
 
 ## ADR-004: API Foundations — Authentication Cookies, CSRF, Cursor Pagination, WebSocket Messaging Boundary
 
-**Status:** Proposed — pending owner approval
+**Status:** Approved — approved by the owner before Phase 1 API implementation began, and implemented since (cookie names/lifetimes, CSRF, cursor pagination and the error contract in `services/api`; the messaging WebSocket boundary per ADR-006). Status line corrected 2026-09-19: it previously still read "Proposed — pending owner approval."
 **Date:** 2026-09-15
 **Scope:** Concrete decisions the API architecture (`docs/05-api/api.md`) depends on but that no prior document pinned to specifics: web authentication cookie/token parameters, CSRF strategy, refresh rotation/revocation behavior, cursor pagination shape, and the messaging WebSocket boundary now required by the separate frontend team's confirmed transport choices (WebSocket for messaging, REST/polling for notifications).
 
