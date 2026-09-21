@@ -15,11 +15,12 @@ interface PageMeta {
 // notifications. Every route is recipient-scoped — there is no way to name
 // another user's notification.
 //
-// Rate limiting: specified in api.md §11 but NOT implemented here. The only
-// limiter that exists (RateLimitGuard) is per IP, in memory and per process;
-// users behind one shared carrier IP would share a counter, so polling
-// `unread-count` could 429 legitimate users. Left off deliberately until an
-// account-keyed limiter exists.
+// Rate limiting: NOT implemented or enforced here, and no Notifications-
+// specific limits are defined yet (api.md §11). The only limiter that exists
+// (RateLimitGuard) is per IP, in memory and per process; users behind one
+// shared carrier IP would share a counter, so polling `unread-count` could
+// 429 legitimate users. Left off deliberately until an account-keyed limiter
+// exists.
 @ApiTags('Notifications')
 @Controller('notifications')
 @UseGuards(JwtAuthGuard)

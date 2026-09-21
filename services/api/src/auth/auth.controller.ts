@@ -14,6 +14,7 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { TokenInvalidException } from '../common/errors/api-exception';
 import { RateLimit } from '../common/guards/rate-limit.decorator';
+import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 import { sha256 } from './token.util';
 
 function buildContext(req: Request): RequestContext {
@@ -148,7 +149,7 @@ export class AuthController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async revokeSession(
     @CurrentUser() user: { sub: string },
-    @Param('sessionId') sessionId: string,
+    @Param('sessionId', ParseUuidPipe) sessionId: string,
   ): Promise<{ data: { revoked: boolean } }> {
     await this.authService.revokeSession(user.sub, sessionId);
     return { data: { revoked: true } };

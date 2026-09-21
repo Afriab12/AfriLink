@@ -7,6 +7,7 @@ import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OptionalCurrentUser } from '../common/decorators/optional-current-user.decorator';
+import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 
 type ListFollowersResult = Awaited<ReturnType<SocialGraphService['listFollowers']>>;
 type ListFollowingResult = Awaited<ReturnType<SocialGraphService['listFollowing']>>;
@@ -22,14 +23,14 @@ export class SocialGraphController {
 
   @Post('users/:userId/follow')
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async follow(@CurrentUser() user: { sub: string }, @Param('userId') userId: string): Promise<{ data: { following: boolean } }> {
+  async follow(@CurrentUser() user: { sub: string }, @Param('userId', ParseUuidPipe) userId: string): Promise<{ data: { following: boolean } }> {
     return { data: await this.socialGraphService.follow(user.sub, userId) };
   }
 
   @Delete('users/:userId/follow')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async unfollow(@CurrentUser() user: { sub: string }, @Param('userId') userId: string): Promise<{ data: { following: boolean } }> {
+  async unfollow(@CurrentUser() user: { sub: string }, @Param('userId', ParseUuidPipe) userId: string): Promise<{ data: { following: boolean } }> {
     return { data: await this.socialGraphService.unfollow(user.sub, userId) };
   }
 
@@ -37,7 +38,7 @@ export class SocialGraphController {
   @UseGuards(OptionalJwtAuthGuard)
   async followers(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('userId') userId: string,
+    @Param('userId', ParseUuidPipe) userId: string,
   ): Promise<{ data: ListFollowersResult }> {
     return { data: await this.socialGraphService.listFollowers(viewer?.sub, userId) };
   }
@@ -46,7 +47,7 @@ export class SocialGraphController {
   @UseGuards(OptionalJwtAuthGuard)
   async following(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('userId') userId: string,
+    @Param('userId', ParseUuidPipe) userId: string,
   ): Promise<{ data: ListFollowingResult }> {
     return { data: await this.socialGraphService.listFollowing(viewer?.sub, userId) };
   }
@@ -57,7 +58,7 @@ export class SocialGraphController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async sendFriendRequest(
     @CurrentUser() user: { sub: string },
-    @Param('userId') userId: string,
+    @Param('userId', ParseUuidPipe) userId: string,
   ): Promise<{ data: FriendshipResponse }> {
     return { data: await this.socialGraphService.sendFriendRequest(user.sub, userId) };
   }
@@ -76,7 +77,7 @@ export class SocialGraphController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async acceptFriendRequest(
     @CurrentUser() user: { sub: string },
-    @Param('friendshipId') friendshipId: string,
+    @Param('friendshipId', ParseUuidPipe) friendshipId: string,
   ): Promise<{ data: FriendshipResponse }> {
     return { data: await this.socialGraphService.acceptFriendRequest(user.sub, friendshipId) };
   }
@@ -86,7 +87,7 @@ export class SocialGraphController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async declineFriendRequest(
     @CurrentUser() user: { sub: string },
-    @Param('friendshipId') friendshipId: string,
+    @Param('friendshipId', ParseUuidPipe) friendshipId: string,
   ): Promise<{ data: FriendshipResponse }> {
     return { data: await this.socialGraphService.declineFriendRequest(user.sub, friendshipId) };
   }
@@ -96,7 +97,7 @@ export class SocialGraphController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async cancelFriendRequest(
     @CurrentUser() user: { sub: string },
-    @Param('friendshipId') friendshipId: string,
+    @Param('friendshipId', ParseUuidPipe) friendshipId: string,
   ): Promise<{ data: { cancelled: boolean } }> {
     await this.socialGraphService.cancelFriendRequest(user.sub, friendshipId);
     return { data: { cancelled: true } };
@@ -107,7 +108,7 @@ export class SocialGraphController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async removeFriendship(
     @CurrentUser() user: { sub: string },
-    @Param('friendshipId') friendshipId: string,
+    @Param('friendshipId', ParseUuidPipe) friendshipId: string,
   ): Promise<{ data: { removed: boolean } }> {
     await this.socialGraphService.removeFriendship(user.sub, friendshipId);
     return { data: { removed: true } };
@@ -117,7 +118,7 @@ export class SocialGraphController {
   @UseGuards(OptionalJwtAuthGuard)
   async friends(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('userId') userId: string,
+    @Param('userId', ParseUuidPipe) userId: string,
   ): Promise<{ data: ListFriendsResult }> {
     return { data: await this.socialGraphService.listFriends(viewer?.sub, userId) };
   }
@@ -126,14 +127,14 @@ export class SocialGraphController {
 
   @Post('users/:userId/block')
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async block(@CurrentUser() user: { sub: string }, @Param('userId') userId: string): Promise<{ data: { blocked: boolean } }> {
+  async block(@CurrentUser() user: { sub: string }, @Param('userId', ParseUuidPipe) userId: string): Promise<{ data: { blocked: boolean } }> {
     return { data: await this.socialGraphService.block(user.sub, userId) };
   }
 
   @Delete('users/:userId/block')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async unblock(@CurrentUser() user: { sub: string }, @Param('userId') userId: string): Promise<{ data: { blocked: boolean } }> {
+  async unblock(@CurrentUser() user: { sub: string }, @Param('userId', ParseUuidPipe) userId: string): Promise<{ data: { blocked: boolean } }> {
     return { data: await this.socialGraphService.unblock(user.sub, userId) };
   }
 

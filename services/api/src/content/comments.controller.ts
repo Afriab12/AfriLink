@@ -9,6 +9,7 @@ import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OptionalCurrentUser } from '../common/decorators/optional-current-user.decorator';
+import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 
 interface PageMeta {
   meta: { page: { nextCursor: string | null; hasMore: boolean } };
@@ -23,7 +24,7 @@ export class CommentsController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async create(
     @CurrentUser() user: { sub: string },
-    @Param('postId') postId: string,
+    @Param('postId', ParseUuidPipe) postId: string,
     @Body() dto: CreateCommentDto,
   ): Promise<{ data: CommentResponse }> {
     return { data: await this.commentsService.createComment(user.sub, postId, dto) };
@@ -33,7 +34,7 @@ export class CommentsController {
   @UseGuards(OptionalJwtAuthGuard)
   async listTopLevel(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('postId') postId: string,
+    @Param('postId', ParseUuidPipe) postId: string,
     @Query() query: PaginationQueryDto,
   ): Promise<{ data: CommentResponse[] } & PageMeta> {
     const { data, nextCursor, hasMore } = await this.commentsService.listTopLevelComments(viewer?.sub, postId, query.cursor, query.limit);
@@ -44,7 +45,7 @@ export class CommentsController {
   @UseGuards(OptionalJwtAuthGuard)
   async listReplies(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('commentId') commentId: string,
+    @Param('commentId', ParseUuidPipe) commentId: string,
     @Query() query: PaginationQueryDto,
   ): Promise<{ data: CommentResponse[] } & PageMeta> {
     const { data, nextCursor, hasMore } = await this.commentsService.listReplies(viewer?.sub, commentId, query.cursor, query.limit);
@@ -55,7 +56,7 @@ export class CommentsController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async update(
     @CurrentUser() user: { sub: string },
-    @Param('commentId') commentId: string,
+    @Param('commentId', ParseUuidPipe) commentId: string,
     @Body() dto: UpdateCommentDto,
   ): Promise<{ data: CommentResponse }> {
     return { data: await this.commentsService.updateComment(user.sub, commentId, dto) };
@@ -64,7 +65,7 @@ export class CommentsController {
   @Delete('comments/:commentId')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async remove(@CurrentUser() user: { sub: string }, @Param('commentId') commentId: string): Promise<{ data: { deleted: boolean } }> {
+  async remove(@CurrentUser() user: { sub: string }, @Param('commentId', ParseUuidPipe) commentId: string): Promise<{ data: { deleted: boolean } }> {
     await this.commentsService.deleteComment(user.sub, commentId);
     return { data: { deleted: true } };
   }

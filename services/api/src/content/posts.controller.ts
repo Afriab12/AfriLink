@@ -9,6 +9,7 @@ import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OptionalCurrentUser } from '../common/decorators/optional-current-user.decorator';
+import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 
 interface PageMeta {
   meta: { page: { nextCursor: string | null; hasMore: boolean } };
@@ -29,7 +30,7 @@ export class PostsController {
   @UseGuards(OptionalJwtAuthGuard)
   async get(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('postId') postId: string,
+    @Param('postId', ParseUuidPipe) postId: string,
   ): Promise<{ data: PostResponse }> {
     return { data: await this.postsService.getPost(viewer?.sub, postId) };
   }
@@ -38,7 +39,7 @@ export class PostsController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async update(
     @CurrentUser() user: { sub: string },
-    @Param('postId') postId: string,
+    @Param('postId', ParseUuidPipe) postId: string,
     @Body() dto: UpdatePostDto,
   ): Promise<{ data: PostResponse }> {
     return { data: await this.postsService.updatePost(user.sub, postId, dto) };
@@ -47,7 +48,7 @@ export class PostsController {
   @Delete('posts/:postId')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async remove(@CurrentUser() user: { sub: string }, @Param('postId') postId: string): Promise<{ data: { deleted: boolean } }> {
+  async remove(@CurrentUser() user: { sub: string }, @Param('postId', ParseUuidPipe) postId: string): Promise<{ data: { deleted: boolean } }> {
     await this.postsService.deletePost(user.sub, postId);
     return { data: { deleted: true } };
   }
@@ -56,7 +57,7 @@ export class PostsController {
   @UseGuards(OptionalJwtAuthGuard)
   async listByUser(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('userId') userId: string,
+    @Param('userId', ParseUuidPipe) userId: string,
     @Query() query: PaginationQueryDto,
   ): Promise<{ data: PostResponse[] } & PageMeta> {
     const { data, nextCursor, hasMore } = await this.postsService.listPostsByUser(viewer?.sub, userId, query.cursor, query.limit);

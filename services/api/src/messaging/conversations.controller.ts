@@ -6,6 +6,7 @@ import { PaginationQueryDto } from './dto/pagination-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 
 interface PageMeta {
   meta: { page: { nextCursor: string | null; hasMore: boolean } };
@@ -35,7 +36,7 @@ export class ConversationsController {
   @Get(':conversationId')
   async get(
     @CurrentUser() user: { sub: string },
-    @Param('conversationId') conversationId: string,
+    @Param('conversationId', ParseUuidPipe) conversationId: string,
   ): Promise<{ data: ConversationResponse }> {
     return { data: await this.conversationsService.getConversation(user.sub, conversationId) };
   }
@@ -45,7 +46,7 @@ export class ConversationsController {
   @UseGuards(CsrfGuard)
   async accept(
     @CurrentUser() user: { sub: string },
-    @Param('conversationId') conversationId: string,
+    @Param('conversationId', ParseUuidPipe) conversationId: string,
   ): Promise<{ data: ConversationResponse }> {
     return { data: await this.conversationsService.acceptConversation(user.sub, conversationId) };
   }
@@ -55,7 +56,7 @@ export class ConversationsController {
   @UseGuards(CsrfGuard)
   async decline(
     @CurrentUser() user: { sub: string },
-    @Param('conversationId') conversationId: string,
+    @Param('conversationId', ParseUuidPipe) conversationId: string,
   ): Promise<{ data: ConversationResponse }> {
     return { data: await this.conversationsService.declineConversation(user.sub, conversationId) };
   }

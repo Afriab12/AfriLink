@@ -8,6 +8,7 @@ import { PaginationQueryDto } from './dto/pagination-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 
 interface PageMeta {
   meta: { page: { nextCursor: string | null; hasMore: boolean } };
@@ -23,7 +24,7 @@ export class MessagesController {
   @UseGuards(CsrfGuard)
   async send(
     @CurrentUser() user: { sub: string },
-    @Param('conversationId') conversationId: string,
+    @Param('conversationId', ParseUuidPipe) conversationId: string,
     @Body() dto: SendMessageDto,
   ): Promise<{ data: MessageResponse }> {
     return { data: await this.messagesService.sendMessage(user.sub, conversationId, dto) };
@@ -32,7 +33,7 @@ export class MessagesController {
   @Get('conversations/:conversationId/messages')
   async list(
     @CurrentUser() user: { sub: string },
-    @Param('conversationId') conversationId: string,
+    @Param('conversationId', ParseUuidPipe) conversationId: string,
     @Query() query: PaginationQueryDto,
   ): Promise<{ data: MessageResponse[] } & PageMeta> {
     const { data, nextCursor, hasMore } = await this.messagesService.listMessages(user.sub, conversationId, query.cursor, query.limit);
@@ -43,7 +44,7 @@ export class MessagesController {
   @UseGuards(CsrfGuard)
   async update(
     @CurrentUser() user: { sub: string },
-    @Param('messageId') messageId: string,
+    @Param('messageId', ParseUuidPipe) messageId: string,
     @Body() dto: UpdateMessageDto,
   ): Promise<{ data: MessageResponse }> {
     return { data: await this.messagesService.updateMessage(user.sub, messageId, dto) };
@@ -52,7 +53,7 @@ export class MessagesController {
   @Delete('messages/:messageId')
   @HttpCode(200)
   @UseGuards(CsrfGuard)
-  async remove(@CurrentUser() user: { sub: string }, @Param('messageId') messageId: string): Promise<{ data: { deleted: boolean } }> {
+  async remove(@CurrentUser() user: { sub: string }, @Param('messageId', ParseUuidPipe) messageId: string): Promise<{ data: { deleted: boolean } }> {
     await this.messagesService.deleteMessage(user.sub, messageId);
     return { data: { deleted: true } };
   }
@@ -62,7 +63,7 @@ export class MessagesController {
   @UseGuards(CsrfGuard)
   async markRead(
     @CurrentUser() user: { sub: string },
-    @Param('conversationId') conversationId: string,
+    @Param('conversationId', ParseUuidPipe) conversationId: string,
     @Body() dto: MarkReadDto,
   ): Promise<{ data: { read: boolean } }> {
     await this.messagesService.markRead(user.sub, conversationId, dto);

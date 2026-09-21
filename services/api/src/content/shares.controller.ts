@@ -8,6 +8,7 @@ import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OptionalCurrentUser } from '../common/decorators/optional-current-user.decorator';
+import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 
 interface PageMeta {
   meta: { page: { nextCursor: string | null; hasMore: boolean } };
@@ -22,7 +23,7 @@ export class SharesController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   async create(
     @CurrentUser() user: { sub: string },
-    @Param('postId') postId: string,
+    @Param('postId', ParseUuidPipe) postId: string,
     @Body() dto: CreateShareDto,
   ): Promise<{ data: ShareResponse }> {
     return { data: await this.sharesService.createShare(user.sub, postId, dto) };
@@ -31,7 +32,7 @@ export class SharesController {
   @Delete('shares/:shareId')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async remove(@CurrentUser() user: { sub: string }, @Param('shareId') shareId: string): Promise<{ data: { deleted: boolean } }> {
+  async remove(@CurrentUser() user: { sub: string }, @Param('shareId', ParseUuidPipe) shareId: string): Promise<{ data: { deleted: boolean } }> {
     await this.sharesService.deleteShare(user.sub, shareId);
     return { data: { deleted: true } };
   }
@@ -40,7 +41,7 @@ export class SharesController {
   @UseGuards(OptionalJwtAuthGuard)
   async listByUser(
     @OptionalCurrentUser() viewer: { sub: string } | undefined,
-    @Param('userId') userId: string,
+    @Param('userId', ParseUuidPipe) userId: string,
     @Query() query: PaginationQueryDto,
   ): Promise<{ data: ShareResponse[] } & PageMeta> {
     const { data, nextCursor, hasMore } = await this.sharesService.listSharesByUser(viewer?.sub, userId, query.cursor, query.limit);
