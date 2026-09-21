@@ -5,11 +5,12 @@ import { ProfilesModule } from './profiles/profiles.module';
 import { SocialGraphModule } from './social-graph/social-graph.module';
 import { ContentModule } from './content/content.module';
 import { MessagingModule } from './messaging/messaging.module';
+import { NotificationsModule } from './notifications/notifications.module';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { RateLimitGuard } from './common/guards/rate-limit.guard';
 
 @Module({
-  imports: [PrismaModule, AuthModule, ProfilesModule, SocialGraphModule, ContentModule, MessagingModule],
+  imports: [PrismaModule, AuthModule, ProfilesModule, SocialGraphModule, ContentModule, MessagingModule, NotificationsModule],
   providers: [{ provide: APP_GUARD, useClass: RateLimitGuard }],
 })
 export class AppModule {}

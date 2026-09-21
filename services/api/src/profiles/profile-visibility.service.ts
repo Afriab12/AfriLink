@@ -35,6 +35,19 @@ export class ProfileVisibilityService {
     return blocked !== null;
   }
 
+  // Every user the given user has blocked or is blocked by (active blocks
+  // only, either direction): the same relation isBlocked() checks pairwise,
+  // for filtering a whole list at once instead of one lookup per row.
+  // De-duplicated, since a mutual block would otherwise list the other user
+  // twice.
+  async blockedUserIds(userId: string): Promise<string[]> {
+    const [blockedByMe, blockedMe] = await Promise.all([
+      this.prisma.block.findMany({ where: { blockerId: userId, deletedAt: null }, select: { blockedId: true } }),
+      this.prisma.block.findMany({ where: { blockedId: userId, deletedAt: null }, select: { blockerId: true } }),
+    ]);
+    return [...new Set([...blockedByMe.map((b) => b.blockedId), ...blockedMe.map((b) => b.blockerId)])];
+  }
+
   // No-op when viewerId is undefined (anonymous) or equals targetId (self)
   // — there's no block relationship to check in either case.
   async assertNotBlocked(viewerId: string | undefined, targetId: string): Promise<void> {
