@@ -1,7 +1,7 @@
 # AfriLink REST API Design
 
-**Status:** The Phase 1 REST surface (identity, profiles/social graph, content, reference data) and the Messaging REST API + WebSocket gateway are implemented and covered by end-to-end tests; an OpenAPI document is generated from the live controllers (`/api/docs`, `/api/docs-json`, and a CI build artifact). Every endpoint below is marked **[Phase 1]** (implemented) or **[Future contract]** (not implemented — design only). Communities and Notifications now have database schemas (Database Phase 2) but no REST API yet; Feed, Media, Moderation, Admin/Audit and Search are still blocked on their database modules (see §15). The implemented Messaging routes are listed in §13.
-**Date:** 2026-09-13 (original draft); rewritten 2026-09-15 for API Architecture Phase — PRD/architecture/database are now approved and Phase 1 database (`identity`, `reference`, `social`, `content`, `integration` schemas) is implemented, migrated, and seeded. This revision corrects several inaccuracies the original draft had relative to the actual schema (see §16 database-consistency findings) and incorporates frontend-team transport decisions (§12). Patched 2026-09-19 to reflect that the Phase 1 REST surface and the Messaging REST/WebSocket surface are implemented, and that the Communities and Notifications database layers now exist (their APIs do not yet).
+**Status:** The Phase 1 REST surface (identity, profiles/social graph, content, reference data) and the Messaging REST API + WebSocket gateway are implemented and covered by end-to-end tests; an OpenAPI document is generated from the live controllers (`/api/docs`, `/api/docs-json`, and a CI build artifact). Every endpoint below is marked **[Phase 1]** (implemented) or **[Future contract]** (not implemented — design only). The Notifications REST API (list, unread count, mark read, dismiss) is implemented and covered by end-to-end tests (§15); Communities has a database schema (Database Phase 2) but no REST API yet; Feed, Media, Moderation, Admin/Audit and Search are still blocked on their database modules (see §15). The implemented Messaging routes are listed in §13 and the Notifications routes in §15.
+**Date:** 2026-09-13 (original draft); rewritten 2026-09-15 for API Architecture Phase — PRD/architecture/database are now approved and Phase 1 database (`identity`, `reference`, `social`, `content`, `integration` schemas) is implemented, migrated, and seeded. This revision corrects several inaccuracies the original draft had relative to the actual schema (see §16 database-consistency findings) and incorporates frontend-team transport decisions (§12). Patched 2026-09-19 to reflect that the Phase 1 REST surface and the Messaging REST/WebSocket surface are implemented, and that the Communities and Notifications database layers now exist (their APIs do not yet). Patched 2026-09-21 to record that the Notifications REST API is now implemented (§15), to add the tracked API follow-ups (§18), and to state the actual rate-limiting implementation status (§11).
 **Base path:** `/api/v1`
 **Format:** JSON over HTTPS; WebSocket gateway for real-time messaging delivery (messaging only — implemented, see §13 and `docs/05-api/messaging-websocket.md`)
 
@@ -31,7 +31,7 @@ flowchart LR
 | Home/community feeds | Feed | `feed` (does not exist yet) | **[Future contract]** |
 | Communities | Communities | `community` (database implemented; no REST API yet) | **[Future contract]** — API not implemented |
 | Messaging | Messaging | `messaging` | **[Implemented]** — REST + WebSocket gateway (§13, ADR-006) |
-| Notifications | Notifications | `notification` (database implemented; no REST API yet) | **[Future contract]** — REST/polling only, decided (§13); API not implemented |
+| Notifications | Notifications | `notification` (database and REST API implemented) | **[Implemented]** — REST/polling only (§13, §15): list, unread count, mark read, dismiss. Producers, preferences endpoints and read-all are not built. |
 | Media | Media | `media` (does not exist yet) | **[Future contract]** |
 | Moderation | Moderation | `moderation` (does not exist yet) | **[Future contract]** |
 | Admin | Admin & Audit | `admin`, `audit` (do not exist yet) | **[Future contract]** |
@@ -271,7 +271,7 @@ Reserved for admin tables/dashboards per the frontend team's direction. **No adm
 
 ## 10. Filtering and sorting
 
-Per-endpoint allowlists only — never pass client-supplied sort/filter fields directly into a query. Phase 1 filters: `GET /users/{userId}/posts` and `/profiles` support no filters beyond pagination for MVP (keeps the resource-vs-CRUD line from §2 clean — add filters only when a real product need appears, not speculatively).
+Per-endpoint allowlists only — never pass client-supplied sort/filter fields directly into a query. Phase 1 filters: `GET /users/{userId}/posts` and `/profiles` support no filters beyond pagination for MVP (keeps the resource-vs-CRUD line from §2 clean — add filters only when a real product need appears, not speculatively). `GET /notifications` supports exactly one filter, `unread=true` (§15).
 
 ## 11. Rate limiting strategy
 
@@ -291,7 +291,9 @@ Layered by IP, account, and device. Concrete MVP limits (illustrative starting p
 | Shares | 30 / hour / account |
 | Search *(future — no search module in Phase 1)* | 60 / hour / account |
 
-`429 RATE_LIMITED` with `Retry-After`. Counters live in Redis; durable security/abuse events remain in PostgreSQL per `architecture.md` §22.
+`429 RATE_LIMITED` with `Retry-After`. Counters are designed to live in Redis *(not implemented; see below)*; durable security/abuse events remain in PostgreSQL per `architecture.md` §22.
+
+**Implementation status (2026-09-21): most of this section is contract only.** The single limiter that exists, `RateLimitGuard` with the `@RateLimit(limit, windowMs)` decorator, is keyed by **IP address** (plus route), keeps its counters **in memory in one process** (they reset on restart and are not shared between instances), and is applied to **six authentication routes only**: register, login, refresh, verification challenges, forgot password and reset password (`auth.controller.ts`). So even the per-account limits above are enforced only per IP, and **no route outside authentication is rate limited at all**: the Friend request, Follow, Post creation, Comments, Reactions and Shares rows above are **specified but not enforced**, and no Messaging or Notifications route is rate limited. **Notifications rate limiting is not currently enforced, and no Notifications-specific limits are defined:** the limits themselves and the account-keyed policy remain to be decided and implemented. The Notifications routes are deliberately not wired to the existing guard: users behind one shared carrier IP would share one counter, so polling `unread-count` could return `429` to legitimate users. They stay unlimited until an account-keyed limiter exists.
 
 ## 12. Idempotency
 
@@ -315,7 +317,7 @@ Full detail in ADR-004 §6, ADR-006 and `docs/05-api/messaging-websocket.md`. Su
 
 **Notifications explicitly do NOT use WebSocket for MVP** — REST/polling only (`GET /notifications`, cursor-paginated, §15). The notification DTO shape is kept WS-event-compatible so a future push channel is additive, not a redesign — nothing built toward it now, and it is deliberately excluded from the WebSocket event list above (an earlier draft of this document had incorrectly included `notification.created` in the WS event set; ADR-004 §7 corrects that).
 
-**Implementation status:** Messaging (REST + WebSocket gateway) is implemented; some designed WebSocket safeguards (token-expiry re-check, disconnect on logout, live block eviction, Origin check) are not yet built — see `docs/05-api/messaging-websocket.md` §14. Notifications have a database schema but no REST API yet.
+**Implementation status:** Messaging (REST + WebSocket gateway) is implemented; some designed WebSocket safeguards (token-expiry re-check, disconnect on logout, live block eviction, Origin check) are not yet built — see `docs/05-api/messaging-websocket.md` §14. The Notifications REST API is implemented (§15); it has no WebSocket channel.
 
 **Implemented Messaging REST routes** (all authenticated; state-changing routes also require the CSRF header, §4; errors and cursor pagination follow §6/§9):
 
@@ -349,21 +351,56 @@ Written for the separate frontend team building against this contract.
 - **Optimistic operations:** safe to optimistically apply follow/reaction/share toggles client-side (server enforces the real state regardless); post/comment creation should wait for the server response before showing as permanent, since content passes validation/policy checks that can reject it.
 - **Idempotency:** attach `Idempotency-Key` (any client-generated UUID) on retryable mutations listed in §12 before retrying a timed-out request — never retry those without one, to avoid duplicate posts/friend-requests/etc.
 - **WebSocket (messaging only):** available now on the `/messaging` namespace. On web, connection auth reuses your existing session cookie automatically — no separate token handling; mobile passes the access token in the Socket.IO handshake `auth` payload.
+- **Notifications (REST polling only, no push channel for the MVP):** poll `GET /notifications/unread-count` for the badge (`count` is exact up to 100; `capped: true` means "100 or more") and `GET /notifications` for the list. `POST /notifications/{id}/read` and `DELETE /notifications/{id}` (dismiss) return `204` with no body and are safe to retry. Both `GET` routes send `Cache-Control: private, no-store`. No rate limit is enforced yet (§11), so pick a polling interval you would be comfortable defending.
 
 ## 15. Phase 2 API contracts (implemented and future)
 
-Communities, Messaging and Notifications now have backing database schemas (Database Phase 2); Feed, Media, Moderation, Admin and Search do not (verified against `database/schema.prisma`). Only Messaging has an implemented API. Every other row is a forward contract boundary, not implemented.
+Communities, Messaging and Notifications now have backing database schemas (Database Phase 2); Feed, Media, Moderation, Admin and Search do not (verified against `database/schema.prisma`). Messaging and Notifications have implemented APIs. Every other row is a forward contract boundary, not implemented.
 
 | Module | Planned transport | Primary resources | Auth/authz | Pagination | DB Phase 2 dependency | Status |
 |---|---|---|---|---|---|---|
 | Feed | REST | `/feed`, `/communities/{id}/feed` | Authenticated; visibility+block+moderation filtering at read time | Cursor (§9 convention) | `feed.entries` and ranking metadata — does not exist | **Future contract only.** Preserves the approved ranking concept (relationship + relevance + recency + basic engagement, `architecture.md` §13) as the design target once buildable. |
 | Communities | REST | `/communities`, memberships, invitations | Scoped community roles, separate from platform roles | Cursor for members/posts | `community.*` — database implemented; no API yet | **Future contract only.** |
 | Messaging | WebSocket (delivery) + REST (writes/history) | `/conversations`, `/conversations/{id}/messages` | Per-conversation participant check | Cursor (§9); WS is not paginated | `messaging.*` — implemented | **Implemented** (§13, ADR-006). |
-| Notifications | REST/polling only (no WS for MVP) | `/notifications`, `/notification-preferences` | Authenticated, recipient-only | Cursor (§9) | `notification.*` — database implemented; no API yet | **Future contract only.** Transport decision (REST, not WS) is final for MVP per frontend team (§13/ADR-004 §7). |
+| Notifications | REST/polling only (no WS for MVP) | `/notifications` *(implemented)*, `/notification-preferences` *(not built)* | Authenticated, recipient-only | Cursor (§9) | `notification.*` — implemented | **Implemented** for list, unread count, mark read and dismiss (routes below). Preferences endpoints, read-all and notification producers are not built. Transport decision (REST, not WS) is final for MVP per frontend team (§13/ADR-004 §7). |
 | Media | REST (signed upload flow) | `/media/uploads`, `/media/{id}` | Owner-authorized | N/A (single-resource reads) | `media.*` — does not exist. Note: `social.profiles.avatar_media_id` and would-be `content.post_media` exist only as unvalidated/absent columns — see §16 finding 1 | **Future contract only.** |
 | Moderation | REST | `/reports`, `/moderation/cases`, appeals | User-facing (own reports) vs. scoped moderator/admin | Cursor for queues | `moderation.*` — does not exist | **Future contract only.** |
 | Admin | REST | `/admin/*` | Platform role + MFA + audit | Offset (§9) | `admin.*`, `audit.*` — do not exist | **Future contract only.** |
 | Search | REST | `/search`, `/search/{type}` | Authenticated; re-checks source visibility per result | Cursor (§9) | `search.*` projection — does not exist | **Future contract only.** |
+
+### Implemented Notifications REST routes
+
+All routes require authentication (JWT). The two state-changing routes also require the CSRF header (§4). Errors follow §6. Every route is **recipient-scoped**: there is no way to name another user's notification, and another user's id is indistinguishable from one that does not exist (`404`).
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/notifications` | The caller's notifications, newest first, cursor-paginated. Optional `unread=true`. Excludes dismissed notifications and notifications from blocked actors (below). |
+| `GET` | `/notifications/unread-count` | `{ "data": { "count", "capped" } }`: the number of unread, non-dismissed, non-blocked notifications, **exact up to 100**; if there are more than 100, `count` is `100` and `capped` is `true` (read it as "100 or more"). Uses exactly the same filters as the list, so the badge cannot disagree with it. |
+| `POST` | `/notifications/{id}/read` | Marks one notification read. `204`, no body. **Idempotent:** repeating it is a no-op that also returns `204`, and the first read time is kept. |
+| `DELETE` | `/notifications/{id}` | Dismisses one notification. `204`, no body. **Idempotent:** dismissing an already-dismissed notification also returns `204`. |
+
+**List behavior**
+- **Cursor:** the standard opaque `(createdAt, id)` cursor of §9, ordered `createdAt` descending then `id` descending. This is the same shape as posts, comments and messages, and **not** the `(last_message_at, id)` shape used by `GET /conversations` (§13). A malformed cursor is `400 INVALID_CURSOR`.
+- **Page size:** default 20, maximum 50. An out-of-range `limit` is **clamped, never rejected**, as §9 specifies; only a non-integer is `422` (compare tracked follow-up T-2, §18, for the routes that reject instead).
+- **`unread=true`:** the only filter. Only the literal `true` is accepted; `false`, `0`, `yes` and an empty value are `422 VALIDATION_FAILED` (field `unread`), because it would be ambiguous whether `false` means "read only" or "everything".
+- **Item fields:** `id`, `type`, `actor`, `targetType`, `targetId`, `groupKey`, `payload`, `readAt`, `createdAt`. `dedupKey`, `recipientUserId` and `deletedAt` are never returned. `type` is an opaque string (no type vocabulary is defined yet) and `payload` is returned exactly as stored.
+- **`actor`:** `null` for a system notification, and also when the actor is no longer active (suspended, banned, deleted, and so on); the notification is kept, the identity is not shown. `{ "id" }` only when the actor's profile is not public (private, or followers-only). `{ "id", "displayName", "handle" }` for a public profile, including a user who has no profile row yet (the existing visibility rule treats that as public).
+
+**Blocked actors.** A notification whose actor the caller has blocked, **or who has blocked the caller**, is hidden from both the list and the unread count, and reappears if the block is removed. System notifications (no actor) are never hidden by this. `POST /notifications/{id}/read` and `DELETE /notifications/{id}` work on the caller's own notifications regardless of blocks.
+
+**Read and dismiss**
+- An id that is not the caller's, does not exist, or (for read) has been dismissed is `404 RESOURCE_NOT_FOUND`, the same answer for all three, so ids cannot be probed. A malformed id is `422 VALIDATION_FAILED` (field `id`), not a `500`.
+- Dismissing is a **soft delete**: the row stays, its deduplication key stays claimed (so a replayed domain event cannot bring a dismissed notification back), and its read state is left as it was. Dismissing does not mark a notification read.
+- Both `GET` routes send `Cache-Control: private, no-store`. There is no WebSocket event for notifications (§13).
+
+**Rate limiting: not currently enforced.** No rate limit applies to these routes, and no Notifications-specific limits are defined yet; a future account-keyed policy remains to be decided and implemented (see the implementation status in §11).
+
+**Not built (this is what "implemented" does not cover)**
+- **Notification producers.** Nothing creates notifications yet, so today the API returns whatever rows exist; it has been exercised with seeded rows (`docs/08-testing/testing.md`).
+- **Preferences endpoints** (`/notification-preferences`), even though the table exists.
+- **Read-all**, deferred by the owner for the MVP and not part of the approved scope.
+- **Deliveries** (push, email, SMS) and the notification **type/category vocabulary**: both still open decisions (`database.md` §10).
+- **Retention:** no retention period has been decided and nothing purges or expires notification rows.
 
 ## 16. Database consistency findings
 
@@ -400,18 +437,25 @@ No missing constraints, ambiguous relationships, or concurrency risks were found
 | Mobile client-type detection mechanism | Needed before mobile auth is implementable | Open — implementation detail, not an architecture blocker |
 | Rate-limit exact thresholds (§11) | Tunable without a design change | Open — illustrative starting values given; production tuning deferred |
 | Audit trail for auth/authz failures | Security observability | Open — blocked on `audit` schema (Database Phase 2), not an API design gap |
-| Communities/Notifications API implementation | Database layers exist; no REST API yet | Open — contracts to be finalized before implementation |
+| Communities API implementation | Database layer exists; no REST API yet | Open — contract to be finalized before implementation |
+| Notifications: producers, preferences endpoints, read-all, deliveries, type vocabulary, retention | The four core routes are implemented (§15); these are the parts around them | Open. Retention and the type/category vocabulary are open decisions; read-all is deferred by the owner for the MVP; deliveries (push/email/SMS) are not started |
 | Feed/Media/Moderation/Admin/Search implementation | All remaining §15 rows | Open — blocked on their Database Phase 2 modules, contracts defined so implementation won't retrofit badly |
 
 ### Tracked API follow-ups
 
-Known defects and gaps in the implemented API that are **not** design decisions, so they do not belong in the table above. All are open and unscheduled; each needs its own test-first change and approval. (Messaging WebSocket follow-ups F-1 to F-6 are tracked separately in `docs/05-api/messaging-websocket.md` §14.)
+Known defects and gaps in the implemented API that are **not** design decisions, so they do not belong in the table above. All are open; T-1 is scheduled as the next task after the Notifications API, the others are unscheduled. Each needs its own test-first change and approval. (Messaging WebSocket follow-ups F-1 to F-6 are tracked separately in `docs/05-api/messaging-websocket.md` §14.)
 
-- [ ] **T-1 — Malformed UUID path parameters return `500 INTERNAL_ERROR` instead of `422 VALIDATION_FAILED`.**
+- [ ] **T-1 — Malformed UUID path parameters return `500 INTERNAL_ERROR` instead of `422 VALIDATION_FAILED`.** **Scheduled: the next task after the Notifications API ships**, before more modules launch with the same pattern.
   - **Verified 2026-09-20** with a probe of 15 routes across content, messaging, social graph and auth (for example `GET /conversations/not-a-uuid`, `PATCH /messages/not-a-uuid`, `GET /posts/not-a-uuid`, `POST /users/not-a-uuid/follow`, `DELETE /auth/sessions/not-a-uuid`): **all 15 returned `500 INTERNAL_ERROR`**, and the server logs a full Prisma error each time. About 30 routes take an ID path parameter and pass the raw string to Prisma; none uses `ParseUUIDPipe` or a validated DTO. The routes not probed follow the same pattern, but were not tested. `GET /profiles/{userIdOrHandle}` accepts a handle and is not in scope.
   - **Expected (§6):** `422 VALIDATION_FAILED` with a field-mapped `details` entry.
   - **Impact:** no data is exposed (the response body is the generic error), but it breaks the §6 error contract, inflates 500-rate monitoring and alerting, and lets any authenticated user generate server errors and error logs at will.
   - **Fix direction (not designed here):** one shared path-parameter DTO or pipe with `@IsUUID()`, applied to every ID route, with a regression test per module. The Notifications API validates its IDs correctly from the start, so it does not add to this list.
+- [ ] **T-2 — `limit` out of range is rejected with `422` instead of being clamped, contradicting §9.**
+  - **The contract (§9):** "Default page size **20**, maximum **50** — server clamps an oversized `limit`, never errors."
+  - **Verified 2026-09-20** by calling nine list endpoints with `limit=51`, `500`, `0`, `-1` and `abc`. `GET /conversations?limit=500` returns **`422 VALIDATION_FAILED`**, not a clamped `200`. Five endpoints behave that way, rejecting every value outside 1 to 50 and every non-integer: `GET /conversations`, `GET /conversations/{id}/messages`, `GET /users/{id}/posts`, `GET /users/{id}/shares` and `GET /posts/{id}/comments`.
+  - **Cause:** the messaging and content `PaginationQueryDto` classes carry `@Min(1) @Max(50)`, so validation rejects the request before each service's `clampLimit()` runs. For those endpoints `clampLimit()` only ever sees in-range values or none.
+  - **Other endpoints:** `GET /users/{id}/followers`, `/following` and `/friends` return `200` for every value; whether they clamp or ignore `limit` was not checked. `GET /notifications` follows §9 (clamps out-of-range values; rejects only a non-integer with `422`). `GET /comments/{id}/replies` and any other list route were not probed.
+  - **Decision needed before fixing:** which is authoritative? Either follow the documented contract (remove `@Min`/`@Max` from the DTOs, a behavior change from `422` to `200` for any client that relies on the rejection), or amend §9 to describe the rejection. The Notifications API already follows the documented clamp.
 
 ## 19. Recommended order after approval
 
