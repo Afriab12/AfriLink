@@ -32,7 +32,7 @@ export class SharesService {
   // once is deliberately allowed, each creating a new row. Not inventing
   // an application-level restriction the database doesn't have.
   async createShare(userId: string, postId: string, dto: CreateShareDto): Promise<ShareResponse> {
-    await this.postAccess.resolveViewablePost(userId, postId);
+    await this.postAccess.resolveInteractablePost(userId, postId);
     const share = await this.prisma.share.create({ data: { userId, postId, comment: dto.comment } });
     return this.toResponse(share);
   }

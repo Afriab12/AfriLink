@@ -90,17 +90,18 @@ describe('Content (e2e)', () => {
       const badVisibility = await request(app.getHttpServer())
         .post('/api/v1/posts')
         .set(auth(a))
-        .send({ body: 'x', visibility: 'community_members' })
+        .send({ body: 'x', visibility: 'everyone' }) // (community_members is a valid audience now, but only together with a communityId)
         .expect(422);
       expect(badVisibility.body.error.code).toBe('VALIDATION_FAILED');
     });
 
-    it('rejects mass-assignment of mediaIds/communityId (Phase 1 is text-only)', async () => {
+    // communityId is a real, validated field now (see community-posts.e2e-spec.ts); media is still not.
+    it('rejects mass-assignment of mediaIds (posts are text-only until the media schema exists)', async () => {
       const a = await registerUser();
       const res = await request(app.getHttpServer())
         .post('/api/v1/posts')
         .set(auth(a))
-        .send({ body: 'x', mediaIds: [randomUUID()], communityId: randomUUID() })
+        .send({ body: 'x', mediaIds: [randomUUID()] })
         .expect(422);
       expect(res.body.error.code).toBe('VALIDATION_FAILED');
     });

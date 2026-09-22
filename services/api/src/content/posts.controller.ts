@@ -4,6 +4,7 @@ import { PostsService, type PostResponse } from './posts.service';
 import { CreatePostDto } from './dto/create-post.dto';
 import { UpdatePostDto } from './dto/update-post.dto';
 import { PaginationQueryDto } from './dto/pagination-query.dto';
+import { CursorQueryDto } from '../common/dto/cursor-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
@@ -51,6 +52,17 @@ export class PostsController {
   async remove(@CurrentUser() user: { sub: string }, @Param('postId', ParseUuidPipe) postId: string): Promise<{ data: { deleted: boolean } }> {
     await this.postsService.deletePost(user.sub, postId);
     return { data: { deleted: true } };
+  }
+
+  @Get('communities/:communityId/posts')
+  @UseGuards(OptionalJwtAuthGuard)
+  async listByCommunity(
+    @OptionalCurrentUser() viewer: { sub: string } | undefined,
+    @Param('communityId', ParseUuidPipe) communityId: string,
+    @Query() query: CursorQueryDto,
+  ): Promise<{ data: PostResponse[] } & PageMeta> {
+    const { data, nextCursor, hasMore } = await this.postsService.listCommunityPosts(viewer?.sub, communityId, query.cursor, query.limit);
+    return { data, meta: { page: { nextCursor, hasMore } } };
   }
 
   @Get('users/:userId/posts')

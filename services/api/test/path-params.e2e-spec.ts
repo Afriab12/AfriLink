@@ -54,6 +54,17 @@ const ROUTES: Route[] = [
   { method: 'POST', path: '/conversations/:conversationId/decline', unknown: 404 },
   { method: 'POST', path: '/conversations/:conversationId/messages', body: { body: 'hi', clientMessageId: randomUUID() }, unknown: 404 },
   { method: 'POST', path: '/conversations/:conversationId/read', body: { messageId: randomUUID() }, unknown: 404 },
+  // communities (two-parameter routes are checked once per parameter)
+  { method: 'PATCH', path: '/communities/:communityId', body: { name: 'edited' }, unknown: 404 },
+  { method: 'DELETE', path: '/communities/:communityId', unknown: 404 },
+  { method: 'PUT', path: '/communities/:communityId/membership', unknown: 404 },
+  { method: 'DELETE', path: '/communities/:communityId/membership', unknown: 404 },
+  { method: 'GET', path: '/communities/:communityId/members', unknown: 404 },
+  { method: 'POST', path: '/communities/:communityId/members/:userId/approve', unknown: 404 },
+  { method: 'POST', path: '/communities/:communityId/members/:userId/reject', unknown: 404 },
+  { method: 'DELETE', path: '/communities/:communityId/members/:userId', unknown: 404 },
+  { method: 'PATCH', path: '/communities/:communityId/members/:userId', body: { role: 'member' }, unknown: 404 },
+  { method: 'GET', path: '/communities/:communityId/posts', unknown: 404 },
   // social graph
   { method: 'DELETE', path: '/friend-requests/:friendshipId', unknown: 404 },
   { method: 'DELETE', path: '/friendships/:friendshipId', unknown: 404 },
@@ -73,13 +84,20 @@ const ROUTES: Route[] = [
   { method: 'POST', path: '/notifications/:id/read', unknown: 404 },
 ];
 
-// The one parametrised route that is NOT a UUID route: it accepts a UUID or a handle, and treats
-// anything that is not a UUID as a handle. Malformed input there is a normal 404, never a 500.
-const NOT_A_UUID_ROUTE = 'GET /profiles/:userIdOrHandle';
+// The parametrised routes that are NOT pure UUID routes: each accepts a UUID or another identifier
+// (a profile handle, a community slug), and treats anything that is not a UUID as that identifier.
+// Malformed input there is a normal 404, never a 500 and never a validation error.
+const NOT_A_UUID_ROUTES = ['GET /profiles/:userIdOrHandle', 'GET /communities/:communityIdOrSlug'];
 
-const paramName = (path: string): string => /:(\w+)/.exec(path)![1];
+const paramNames = (path: string): string[] => [...path.matchAll(/:(\w+)/g)].map((m) => m[1]);
 const label = (r: Route): string => `${r.method} ${r.path}`;
-const withId = (path: string, id: string): string => '/api/v1' + path.replace(/:\w+/, encodeURIComponent(id));
+// A valid UUID for every parameter other than the one under test.
+const VALID_OTHER = '018f0000-0000-7000-8000-000000000123';
+// Replaces path parameter number `which` (0-based) with `id`; every other parameter gets a valid UUID.
+function withId(path: string, id: string, which = 0): string {
+  let i = 0;
+  return '/api/v1' + path.replace(/:\w+/g, () => (i++ === which ? encodeURIComponent(id) : VALID_OTHER));
+}
 
 function extractCookies(res: request.Response): Record<string, string> {
   const setCookie = res.headers['set-cookie'];
@@ -101,8 +119,8 @@ function newApp(app: INestApplication): void {
   app.useGlobalFilters(new HttpExceptionFilter());
 }
 
-function call(app: INestApplication, r: Route, id: string, headers: Record<string, string>) {
-  const req = request(app.getHttpServer())[r.method.toLowerCase() as 'get'](withId(r.path, id)).set(headers);
+function call(app: INestApplication, r: Route, id: string, headers: Record<string, string>, which = 0) {
+  const req = request(app.getHttpServer())[r.method.toLowerCase() as 'get'](withId(r.path, id, which)).set(headers);
   return r.body ? req.send(r.body) : req;
 }
 
@@ -153,9 +171,12 @@ describe('Path parameter validation at the request boundary (T-1)', () => {
     dbHits.length = 0;
   });
 
-  it.each(ROUTES)('$method $path rejects a malformed id with 422 and never reaches the database', async (r) => {
-    const res = await call(app, r, 'not-a-uuid', auth);
-    const field = paramName(r.path);
+  // one case per (route, path parameter): a two-parameter route is checked for each of its ids
+  const CASES = ROUTES.flatMap((r) => paramNames(r.path).map((param, which) => ({ label: label(r), param, which, r })));
+
+  it.each(CASES)('$label rejects a malformed $param with 422 and never reaches the database', async ({ r, param, which }) => {
+    const res = await call(app, r, 'not-a-uuid', auth, which);
+    const field = param;
 
     expect(res.status).toBe(422);
     expect(res.body.error.code).toBe('VALIDATION_FAILED');
@@ -236,10 +257,10 @@ describe('Path parameter validation at the request boundary (T-1)', () => {
     expect(dbHits).toEqual([]);
   });
 
-  it('the user-or-handle profile route is unaffected: a non-UUID is a handle, and is never a 500', async () => {
+  it.each(['/api/v1/profiles/not-a-uuid', '/api/v1/communities/not-a-uuid'])('the id-or-name route %s is unaffected: a non-UUID is a handle or slug, never a validation error', async (path) => {
     dbHits.length = 0;
     // (the tripwire makes this a 500 by design; what matters is that it is NOT rejected as a validation error)
-    const res = await request(app.getHttpServer()).get('/api/v1/profiles/not-a-uuid');
+    const res = await request(app.getHttpServer()).get(path);
     expect(res.status).not.toBe(422);
   });
 });
@@ -283,12 +304,12 @@ describe('Every parametrised route is covered (T-1)', () => {
     }
 
     const covered = ROUTES.map(label);
-    const uncovered = discovered.filter((d) => !covered.includes(d) && d !== NOT_A_UUID_ROUTE);
+    const uncovered = discovered.filter((d) => !covered.includes(d) && !NOT_A_UUID_ROUTES.includes(d));
     const stale = covered.filter((c) => !discovered.includes(c));
 
     expect(uncovered, 'parametrised routes with no path-validation test: add them to ROUTES').toEqual([]);
     expect(stale, 'ROUTES entries that no longer exist').toEqual([]);
-    expect(discovered).toContain(NOT_A_UUID_ROUTE);
+    for (const exempt of NOT_A_UUID_ROUTES) expect(discovered, `exempt route ${exempt} no longer exists`).toContain(exempt);
   });
 });
 
@@ -350,8 +371,8 @@ describe('Valid UUIDs behave as they did before T-1 (real database)', () => {
     await request(app.getHttpServer()).get(`/api/v1/users/${userId}/followers`).set(headers).expect(200);
   });
 
-  it('the user-or-handle profile route still treats a non-UUID as a handle (404, unchanged)', async () => {
-    const res = await request(app.getHttpServer()).get('/api/v1/profiles/not-a-uuid').set(headers);
+  it.each(['/api/v1/profiles/not-a-uuid', '/api/v1/communities/not-a-uuid'])('the id-or-name route %s still treats a non-UUID as a handle or slug (404, unchanged)', async (path) => {
+    const res = await request(app.getHttpServer()).get(path).set(headers);
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe('RESOURCE_NOT_FOUND');
   });

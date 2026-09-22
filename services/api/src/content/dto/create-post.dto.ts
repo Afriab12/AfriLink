@@ -1,10 +1,11 @@
-import { IsIn, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
 
-// No mediaIds, no communityId — content.post_media/comment_media don't
-// exist in Phase 1, and content.posts.community_id has no FK to validate
-// against (no `community` schema yet). Posts are text-only for now — see
-// api.md §16 finding 3 (this was already established during API
-// architecture design, not a new decision here).
+// No mediaIds — content.post_media/comment_media don't exist yet, so posts
+// are text-only (api.md §16 finding 3).
+//
+// `community_members` is only valid together with a communityId, and inside
+// a community only `public` and `community_members` are (PostsService checks
+// the pairing, since it depends on the community).
 export class CreatePostDto {
   @IsString()
   @MinLength(1)
@@ -12,8 +13,12 @@ export class CreatePostDto {
   body!: string;
 
   @IsOptional()
-  @IsIn(['public', 'followers', 'private'])
-  visibility?: 'public' | 'followers' | 'private';
+  @IsIn(['public', 'followers', 'private', 'community_members'])
+  visibility?: 'public' | 'followers' | 'private' | 'community_members';
+
+  @IsOptional()
+  @IsUUID()
+  communityId?: string;
 
   @IsOptional()
   @IsIn(['en']) // English-only for MVP, ADR-003 §7

@@ -1,5 +1,6 @@
 import { IsIn, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 
+// No communityId: a post cannot be moved into or out of a community.
 export class UpdatePostDto {
   @IsOptional()
   @IsString()
@@ -8,6 +9,6 @@ export class UpdatePostDto {
   body?: string;
 
   @IsOptional()
-  @IsIn(['public', 'followers', 'private'])
-  visibility?: 'public' | 'followers' | 'private';
+  @IsIn(['public', 'followers', 'private', 'community_members'])
+  visibility?: 'public' | 'followers' | 'private' | 'community_members';
 }

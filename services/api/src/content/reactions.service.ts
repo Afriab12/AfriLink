@@ -16,7 +16,7 @@ export class ReactionsService {
   // composite primary key itself enforces this, so "add" and "change" are
   // the same upsert operation, never a second row.
   async setPostReaction(userId: string, postId: string, type: ReactionType): Promise<{ type: ReactionType }> {
-    await this.postAccess.resolveViewablePost(userId, postId);
+    await this.postAccess.resolveInteractablePost(userId, postId);
     const reaction = await this.prisma.postReaction.upsert({
       where: { userId_postId: { userId, postId } },
       update: { reactionType: type, deletedAt: null },
@@ -37,7 +37,7 @@ export class ReactionsService {
     if (!comment || comment.deletedAt) {
       throw new ResourceNotFoundException();
     }
-    await this.postAccess.resolveViewablePost(userId, comment.postId);
+    await this.postAccess.resolveInteractablePost(userId, comment.postId);
 
     const reaction = await this.prisma.commentReaction.upsert({
       where: { userId_commentId: { userId, commentId } },

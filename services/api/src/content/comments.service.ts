@@ -42,7 +42,7 @@ export class CommentsService {
     // Must be able to view the post to comment on it — interaction never
     // exceeds visibility (same rule applied consistently across the
     // social-graph module).
-    await this.postAccess.resolveViewablePost(authorId, postId);
+    await this.postAccess.resolveInteractablePost(authorId, postId);
 
     if (dto.parentCommentId) {
       const parent = await this.prisma.comment.findUnique({ where: { id: dto.parentCommentId } });
