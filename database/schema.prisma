@@ -1,12 +1,13 @@
 // AfriLink database schema — Phase 1 + Database Phase 2 (Communities,
-// Messaging, Notifications)
+// Messaging, Notifications, Media)
 //
 // Phase 1 scope: identity, reference, social, content, integration
 // (docs/04-database/database.md §25, step 2).
 // Database Phase 2 scope (in progress): `community` (§8), `messaging`
-// (§9), `notification` (§10). Media, moderation, audit, feed, and search
-// are still NOT modeled here yet — added incrementally, one module at a
-// time, in later phases.
+// (§9), `notification` (§10), `media` (§11, design in
+// docs/04-database/media.md — NOT YET MIGRATED, see that note below).
+// Moderation, audit, feed, and search are still NOT modeled here yet —
+// added incrementally, one module at a time, in later phases.
 //
 // Design source of truth: docs/04-database/database.md
 // Approved decisions: docs/10-decisions/decisions.md (ADR-001, ADR-003),
@@ -15,16 +16,17 @@
 // Deliberate Phase 1 omissions (see database.md for each):
 // - `content.posts.reply_to_post_id` — threaded posts are not an approved
 //   product decision (database.md §6: "only if threaded posts are approved").
-// - `content.post_media` / `content.comment_media` — depend on the `media`
-//   schema, which is not part of Phase 1 or this Communities increment.
+// - `content.post_media` — depended on the `media` schema; both now exist
+//   below (Media increment). `content.comment_media` remains undesigned —
+//   comment media is not approved product scope (PRD §17/§31 do not name
+//   it; media.md §4/§14 decision 1).
 // - `content.visibility_rules` — exception-list table, not needed until a
 //   visibility exception actually arises (database.md §6).
-// - `social.profiles.avatar_media_id` is a plain nullable UUID column with
-//   NO foreign key yet, because the `media` schema doesn't exist yet. Same
-//   treatment now applied to `community.communities.avatar_media_id` /
-//   `cover_media_id` below. `content.posts.community_id` DOES now get its
-//   foreign key, added in this increment (see Post.community below) — the
-//   `community` schema it pointed at now exists.
+// - `social.profiles.avatar_media_id` / `community.communities.
+//   avatar_media_id` / `cover_media_id` now have real foreign keys to
+//   `media.assets` (Media increment, below) — `content.posts.community_id`
+//   got the same treatment in the Communities increment once `community`
+//   existed.
 //
 // Deliberate Communities-increment omission:
 // - `community.moderator_assignments` — database.md §8 frames this as
@@ -90,6 +92,56 @@
 //   designs it — a notification must survive (and re-resolve visibility
 //   against) its target, and notification payloads never carry message
 //   bodies.
+//
+// Media-increment design (docs/04-database/media.md, owner decisions
+// 2026-09-22) — schema drafted for review; NOT YET MIGRATED:
+// - `content.comment_media` is not modeled — not approved product scope
+//   (decision 1).
+// - No quota table or enforcement — calculated, not maintained, once real
+//   numbers exist post-launch (decision 2); nothing here blocks adding it
+//   later without a redesign.
+// - `AssetState` is deliberately 4 values (pending/processing/ready/
+//   rejected), not 5 — 'deleted' is the separate `deletedAt` timestamp,
+//   the same two-track pattern as `ContentStatus`/
+//   `CommunityMembershipStatus`.
+// - `AssetScanState` (pending/passed/failed/skipped) and `AssetModerationState`
+//   (mirrors `MessageModerationState`'s active/hidden/removed exactly, as
+//   its own type — no cross-schema type reuse, same reasoning already
+//   applied to messaging) are both real Postgres enums: small, closed,
+//   stable sets.
+// - `purpose` (on `Asset`) and `variantName` (on `Variant`) stay
+//   app-validated text, not enums — architecture.md §16 explicitly
+//   anticipates both growing without a pipeline change.
+// - `PostMedia`/`MessageAttachment` are separate join tables per content
+//   type (composite PK, matching `PostReaction`/`CommentReaction`/
+//   `UserInterest`'s existing pure-join-table convention), not one shared
+//   polymorphic attachment table — media.md §4 compares both and rejects
+//   the polymorphic option for the same reason database.md §12 already
+//   gives for `moderation.reports`.
+// - `PostMedia.assetId` / `MessageAttachment.assetId` are `onDelete:
+//   Restrict` (an asset's own retention job governs its deletion, not an
+//   unrelated post/message cascade); `postId`/`messageId` are `Cascade`
+//   (an attachment row is meaningless without its parent, matching every
+//   other post/message child table).
+// - `Profile.avatarMediaId` / `Community.avatarMediaId` / `coverMediaId`
+//   are now real, nullable `SetNull` foreign keys to `media.assets` — no
+//   backfill needed, both columns are 100% NULL in the current dev
+//   database (verified).
+// - Retention (owner decision, 2026-09-22): expired uploads and rejected
+//   assets purge after **7 days** (shorter than the general 90-day
+//   window — this content was never published). Orphaned (unreferenced)
+//   assets become eligible for cleanup **48 hours** after their last
+//   attachment/avatar/cover reference is removed. Neither number is
+//   enforced by the schema itself (no scheduled job exists yet) — they
+//   are the parameters a future cleanup job reads via `(status,
+//   expiresAt)` / `(deletedAt)`.
+// - `Variant.updatedAt` was added (owner decision 2026-09-22) though
+//   database.md §11's original field list didn't list it, for
+//   consistency with every other table and to track in-place variant
+//   regeneration.
+// - No dependency, migration, or storage integration exists yet — this is
+//   the schema draft only, per the explicit step-by-step gate this
+//   increment is following.
 
 generator client {
   provider        = "prisma-client-js"
@@ -100,7 +152,7 @@ datasource db {
   provider   = "postgresql"
   // Connection URL moved to prisma7.config.ts (Prisma 7 no longer accepts
   // `url` directly in schema.prisma — see database/prisma7.config.ts).
-  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "notification", "integration"]
+  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "notification", "media", "integration"]
   extensions = [citext]
 }
 
@@ -139,36 +191,38 @@ model User {
   updatedAt   DateTime    @updatedAt @map("updated_at") @db.Timestamptz
   deletedAt   DateTime?   @map("deleted_at") @db.Timestamptz
 
-  credentials            Credential[]
-  sessions               Session[]
-  verificationChallenges VerificationChallenge[]
-  userRoles              UserRole[]
-  profile                Profile?
-  userInterests          UserInterest[]
-  followsAsFollower      Follow[]          @relation("FollowerFollows")
-  followsAsFollowee      Follow[]          @relation("FolloweeFollows")
-  friendshipsRequested   Friendship[]      @relation("FriendshipRequester")
-  friendshipsReceived    Friendship[]      @relation("FriendshipAddressee")
-  blocksAsBlocker        Block[]           @relation("BlockerBlocks")
-  blocksAsBlocked        Block[]           @relation("BlockedByBlocks")
-  preferences            UserPreference?
-  posts                  Post[]
-  comments               Comment[]
-  postReactions          PostReaction[]
-  commentReactions       CommentReaction[]
-  shares                 Share[]
-  ownedCommunities              Community[]           @relation("CommunityOwner")
-  communityMemberships          CommunityMembership[]
-  sentCommunityInvitations      CommunityInvitation[]  @relation("CommunityInvitationInviter")
-  receivedCommunityInvitations  CommunityInvitation[]  @relation("CommunityInvitationInvitee")
-  createdConversations          Conversation[]         @relation("ConversationCreator")
-  directConversationsAsA        Conversation[]         @relation("ConversationDirectParticipantA")
-  directConversationsAsB        Conversation[]         @relation("ConversationDirectParticipantB")
-  conversationParticipations    Participant[]
-  sentMessages                  Message[]              @relation("MessageSender")
-  receivedNotifications         Notification[]         @relation("NotificationRecipient")
-  triggeredNotifications        Notification[]         @relation("NotificationActor")
-  notificationPreferences       NotificationPreference[]
+  credentials                  Credential[]
+  sessions                     Session[]
+  verificationChallenges       VerificationChallenge[]
+  userRoles                    UserRole[]
+  profile                      Profile?
+  userInterests                UserInterest[]
+  followsAsFollower            Follow[]                 @relation("FollowerFollows")
+  followsAsFollowee            Follow[]                 @relation("FolloweeFollows")
+  friendshipsRequested         Friendship[]             @relation("FriendshipRequester")
+  friendshipsReceived          Friendship[]             @relation("FriendshipAddressee")
+  blocksAsBlocker              Block[]                  @relation("BlockerBlocks")
+  blocksAsBlocked              Block[]                  @relation("BlockedByBlocks")
+  preferences                  UserPreference?
+  posts                        Post[]
+  comments                     Comment[]
+  postReactions                PostReaction[]
+  commentReactions             CommentReaction[]
+  shares                       Share[]
+  ownedCommunities             Community[]              @relation("CommunityOwner")
+  communityMemberships         CommunityMembership[]
+  sentCommunityInvitations     CommunityInvitation[]    @relation("CommunityInvitationInviter")
+  receivedCommunityInvitations CommunityInvitation[]    @relation("CommunityInvitationInvitee")
+  createdConversations         Conversation[]           @relation("ConversationCreator")
+  directConversationsAsA       Conversation[]           @relation("ConversationDirectParticipantA")
+  directConversationsAsB       Conversation[]           @relation("ConversationDirectParticipantB")
+  conversationParticipations   Participant[]
+  sentMessages                 Message[]                @relation("MessageSender")
+  receivedNotifications        Notification[]           @relation("NotificationRecipient")
+  triggeredNotifications       Notification[]           @relation("NotificationActor")
+  notificationPreferences      NotificationPreference[]
+  ownedMediaAssets             Asset[]                  @relation("AssetOwner")
+  mediaUploads                 Upload[]                 @relation("UploadOwner")
 
   @@index([status, createdAt])
   @@index([deletedAt]) // deleted-at lifecycle queries, per database.md §4
@@ -278,15 +332,15 @@ model RolePermission {
 }
 
 model UserRole {
-  id         String    @id @default(uuid(7)) @db.Uuid
-  userId     String    @map("user_id") @db.Uuid
-  roleId     String    @map("role_id") @db.Uuid
-  scopeType  String?   @map("scope_type")
-  scopeId    String?   @map("scope_id") @db.Uuid
-  grantedBy  String?   @map("granted_by") @db.Uuid
-  grantedAt  DateTime  @default(now()) @map("granted_at") @db.Timestamptz
-  expiresAt  DateTime? @map("expires_at") @db.Timestamptz
-  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  roleId    String    @map("role_id") @db.Uuid
+  scopeType String?   @map("scope_type")
+  scopeId   String?   @map("scope_id") @db.Uuid
+  grantedBy String?   @map("granted_by") @db.Uuid
+  grantedAt DateTime  @default(now()) @map("granted_at") @db.Timestamptz
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
@@ -348,22 +402,26 @@ enum ProfileVisibility {
 }
 
 model Profile {
-  userId              String            @id @map("user_id") @db.Uuid
-  displayName         String?           @map("display_name")
-  bio                 String?
-  avatarMediaId       String?           @map("avatar_media_id") @db.Uuid // FK to media.assets added when `media` schema exists (later phase)
-  countryCode         String?           @map("country_code") @db.Char(2)
-  region              String?
-  websiteUrl          String?           @map("website_url")
-  visibility          ProfileVisibility @default(public)
-  primaryLanguage     String            @default("en") @map("primary_language") // English-only for MVP per ADR-003 §7; no reference.languages table yet
-  profileMetadata     Json?             @map("profile_metadata")
-  createdAt           DateTime          @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt           DateTime          @updatedAt @map("updated_at") @db.Timestamptz
-  deletedAt           DateTime?         @map("deleted_at") @db.Timestamptz
+  userId          String            @id @map("user_id") @db.Uuid
+  displayName     String?           @map("display_name")
+  bio             String?
+  avatarMediaId   String?           @map("avatar_media_id") @db.Uuid
+  countryCode     String?           @map("country_code") @db.Char(2)
+  region          String?
+  websiteUrl      String?           @map("website_url")
+  visibility      ProfileVisibility @default(public)
+  primaryLanguage String            @default("en") @map("primary_language") // English-only for MVP per ADR-003 §7; no reference.languages table yet
+  profileMetadata Json?             @map("profile_metadata")
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime          @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt       DateTime?         @map("deleted_at") @db.Timestamptz
 
   user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   country Country? @relation(fields: [countryCode], references: [code])
+  // SetNull: an avatar is a reference, not ownership — a hard-purged
+  // asset (end of its own retention window) must not destroy or block
+  // deleting the profile, same reasoning as Notification.actor.
+  avatar  Asset?   @relation("ProfileAvatar", fields: [avatarMediaId], references: [id], onDelete: SetNull)
 
   @@index([countryCode])
   @@map("profiles")
@@ -386,8 +444,8 @@ model UserInterest {
 
 enum FollowStatus {
   active // single value for Phase 1; deletedAt handles removal.
-         // `status` kept per database.md §5 as a placeholder for a future
-         // distinction (e.g. muted-but-following) — not a current need.
+  // `status` kept per database.md §5 as a placeholder for a future
+  // distinction (e.g. muted-but-following) — not a current need.
 
   @@schema("social")
 }
@@ -421,14 +479,14 @@ enum FriendshipStatus {
 }
 
 model Friendship {
-  id           String           @id @default(uuid(7)) @db.Uuid
-  requesterId  String           @map("requester_id") @db.Uuid
-  addresseeId  String           @map("addressee_id") @db.Uuid
-  status       FriendshipStatus @default(pending)
-  requestedAt  DateTime         @default(now()) @map("requested_at") @db.Timestamptz
-  respondedAt  DateTime?        @map("responded_at") @db.Timestamptz
-  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt    DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  id          String           @id @default(uuid(7)) @db.Uuid
+  requesterId String           @map("requester_id") @db.Uuid
+  addresseeId String           @map("addressee_id") @db.Uuid
+  status      FriendshipStatus @default(pending)
+  requestedAt DateTime         @default(now()) @map("requested_at") @db.Timestamptz
+  respondedAt DateTime?        @map("responded_at") @db.Timestamptz
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime         @updatedAt @map("updated_at") @db.Timestamptz
 
   requester User @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
   addressee User @relation("FriendshipAddressee", fields: [addresseeId], references: [id], onDelete: Cascade)
@@ -463,15 +521,15 @@ model Block {
 }
 
 model UserPreference {
-  userId               String    @id @map("user_id") @db.Uuid
+  userId               String            @id @map("user_id") @db.Uuid
   profileVisibility    ProfileVisibility @default(public) @map("profile_visibility")
-  friendListVisible    Boolean   @default(false) @map("friend_list_visible")
-  discoverable         Boolean   @default(true) @map("discoverable")
-  quietHoursStart      String?   @map("quiet_hours_start") // "HH:MM", app-validated
-  quietHoursEnd        String?   @map("quiet_hours_end")
-  notificationDefaults Json?     @map("notification_defaults")
-  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  friendListVisible    Boolean           @default(false) @map("friend_list_visible")
+  discoverable         Boolean           @default(true) @map("discoverable")
+  quietHoursStart      String?           @map("quiet_hours_start") // "HH:MM", app-validated
+  quietHoursEnd        String?           @map("quiet_hours_end")
+  notificationDefaults Json?             @map("notification_defaults")
+  createdAt            DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime          @updatedAt @map("updated_at") @db.Timestamptz
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -492,29 +550,30 @@ enum ContentStatus {
 }
 
 model Post {
-  id          String        @id @default(uuid(7)) @db.Uuid
-  authorId    String        @map("author_id") @db.Uuid
-  communityId String?       @map("community_id") @db.Uuid
-  body        String
-  status      ContentStatus @default(published)
-  visibility  String        @default("public") // public | followers | community_members | mentioned_users | private — kept as validated text, not enum, until community/mention scope exists to exercise the full set
-  languageCode String       @default("en") @map("language_code")
-  publishedAt DateTime?     @map("published_at") @db.Timestamptz
-  editedAt    DateTime?     @map("edited_at") @db.Timestamptz
-  deletedAt   DateTime?     @map("deleted_at") @db.Timestamptz
-  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+  id           String        @id @default(uuid(7)) @db.Uuid
+  authorId     String        @map("author_id") @db.Uuid
+  communityId  String?       @map("community_id") @db.Uuid
+  body         String
+  status       ContentStatus @default(published)
+  visibility   String        @default("public") // public | followers | community_members | mentioned_users | private — kept as validated text, not enum, until community/mention scope exists to exercise the full set
+  languageCode String        @default("en") @map("language_code")
+  publishedAt  DateTime?     @map("published_at") @db.Timestamptz
+  editedAt     DateTime?     @map("edited_at") @db.Timestamptz
+  deletedAt    DateTime?     @map("deleted_at") @db.Timestamptz
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz
 
-  author    User             @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  author    User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
   // SetNull, not Cascade: a post shouldn't be destroyed by a (rare, hard)
   // community deletion — it just becomes uncommunitied, same as its
   // author's account isn't touched either. Community-membership/visibility
   // *enforcement* for `community_members` posts is application-layer work,
   // out of scope for this database-only Communities increment.
-  community Community?       @relation(fields: [communityId], references: [id], onDelete: SetNull)
+  community Community?     @relation(fields: [communityId], references: [id], onDelete: SetNull)
   comments  Comment[]
   reactions PostReaction[]
   shares    Share[]
+  media     PostMedia[]
 
   @@index([authorId, createdAt(sort: Desc), id(sort: Desc)])
   @@index([communityId, createdAt(sort: Desc), id(sort: Desc)])
@@ -606,6 +665,31 @@ model Share {
   @@schema("content")
 }
 
+// Media increment (docs/04-database/media.md §4): joins an approved
+// media.assets row to a post, with explicit ordering and alt text.
+// Composite PK, not a surrogate id + separate unique — matches
+// PostReaction/CommentReaction/UserInterest's existing pure-join-table
+// convention; this table has no independent lifecycle beyond exists/
+// not-exists (no re-attach history to preserve, unlike CommunityMembership).
+model PostMedia {
+  postId       String   @map("post_id") @db.Uuid
+  assetId      String   @map("asset_id") @db.Uuid
+  displayOrder Int      @default(0) @map("display_order")
+  altText      String?  @map("alt_text")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  post  Post  @relation(fields: [postId], references: [id], onDelete: Cascade)
+  // Restrict: the asset's own retention job governs its deletion, not an
+  // unrelated post-delete cascade (media.md §4/§8).
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@id([postId, assetId])
+  @@index([postId, displayOrder])
+  @@index([assetId]) // orphan-cleanup lookup: "does anything still reference this asset?"
+  @@map("post_media")
+  @@schema("content")
+}
+
 // ============================================================
 // community schema — docs/04-database/database.md §8
 // (Database Phase 2, Communities module only)
@@ -635,8 +719,8 @@ enum CommunityMembershipStatus {
 }
 
 model Community {
-  id               String    @id @default(uuid(7)) @db.Uuid
-  ownerUserId      String    @map("owner_user_id") @db.Uuid
+  id               String              @id @default(uuid(7)) @db.Uuid
+  ownerUserId      String              @map("owner_user_id") @db.Uuid
   slug             String
   name             String
   description      String?
@@ -646,22 +730,25 @@ model Community {
   // and PRD §24/§25 don't resolve an exact policy list either — kept as
   // validated text, same treatment as `content.posts.visibility` until a
   // closed set is actually approved.
-  membershipPolicy String    @default("open") @map("membership_policy")
-  avatarMediaId    String?   @map("avatar_media_id") @db.Uuid // FK to media.assets added when `media` schema exists (later phase)
-  coverMediaId     String?   @map("cover_media_id") @db.Uuid // FK to media.assets added when `media` schema exists (later phase)
+  membershipPolicy String              @default("open") @map("membership_policy")
+  avatarMediaId    String?             @map("avatar_media_id") @db.Uuid
+  coverMediaId     String?             @map("cover_media_id") @db.Uuid
   rules            String?
   // Not an enum, same reasoning as membershipPolicy above — database.md
   // §8 names `status` but never enumerates it for `communities` (contrast
   // `memberships.status`, which IS enumerated and IS a real enum below).
-  status           String    @default("active")
-  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz
-  deletedAt        DateTime? @map("deleted_at") @db.Timestamptz
+  status           String              @default("active")
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime            @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt        DateTime?           @map("deleted_at") @db.Timestamptz
 
   owner       User                  @relation("CommunityOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
   memberships CommunityMembership[]
   invitations CommunityInvitation[]
   posts       Post[]
+  // SetNull, same reasoning as Profile.avatar above.
+  avatar      Asset?                @relation("CommunityAvatar", fields: [avatarMediaId], references: [id], onDelete: SetNull)
+  cover       Asset?                @relation("CommunityCover", fields: [coverMediaId], references: [id], onDelete: SetNull)
 
   // Unique ACTIVE slug (WHERE deleted_at IS NULL) is a partial unique
   // index in the migration SQL, not a plain @unique here — matching the
@@ -753,15 +840,15 @@ enum MessageModerationState {
 }
 
 model Conversation {
-  id        String    @id @default(uuid(7)) @db.Uuid
+  id                   String    @id @default(uuid(7)) @db.Uuid
   // CHECK-constrained to 'direct' only for as long as messaging stays
   // MVP scope (ADR-002 §7: one-to-one only; database.md §9 "Phase
   // scoping" — the column exists so group conversations don't require a
   // restructure later; widening the CHECK to add 'group' when approved
   // is a pure additive migration, not attempted here).
-  kind      String    @default("direct")
-  createdBy String?   @map("created_by") @db.Uuid
-  title     String?
+  kind                 String    @default("direct")
+  createdBy            String?   @map("created_by") @db.Uuid
+  title                String?
   // Not an enum: database.md §9 names this field but never enumerates
   // it. Carries the message-request pending/accepted state per
   // architecture.md §14 ("a conversation/message state ... not a
@@ -769,7 +856,7 @@ model Conversation {
   // — default 'pending' until the application marks it accepted,
   // matching PRD §19's hold-until-accepted flow for a first message
   // from a non-connection.
-  status    String    @default("pending")
+  status               String    @default("pending")
   // Denormalized canonical unordered pair, 'direct' conversations ONLY
   // (NULL for any future non-direct kind) — added beyond database.md
   // §9's literal field list specifically so the database itself can
@@ -779,12 +866,12 @@ model Conversation {
   // instead of relying on application-level dedup logic — this turn's
   // explicit requirement. Kept in sync with `participants` by whichever
   // future application code creates the conversation.
-  directParticipantAId String? @map("direct_participant_a_id") @db.Uuid
-  directParticipantBId String? @map("direct_participant_b_id") @db.Uuid
-  lastMessageAt DateTime? @map("last_message_at") @db.Timestamptz
-  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz
-  deletedAt     DateTime? @map("deleted_at") @db.Timestamptz
+  directParticipantAId String?   @map("direct_participant_a_id") @db.Uuid
+  directParticipantBId String?   @map("direct_participant_b_id") @db.Uuid
+  lastMessageAt        DateTime? @map("last_message_at") @db.Timestamptz
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  deletedAt            DateTime? @map("deleted_at") @db.Timestamptz
 
   // SetNull: who started a conversation is metadata, not something that
   // should block a (hard, rare) user deletion or cascade-destroy the
@@ -859,7 +946,7 @@ model Message {
   // database.md §9. Distinct from integration.idempotency_keys (that
   // table is generic command/response caching; this is message-send-
   // specific and cheaper to check on the hot send path).
-  clientMessageId String                  @map("client_message_id")
+  clientMessageId  String                 @map("client_message_id")
   body             String
   // Not an enum — see Conversation.status comment; database.md §9 names
   // but doesn't enumerate this. Exact send-lifecycle values are left
@@ -871,7 +958,7 @@ model Message {
   editedAt         DateTime?              @map("edited_at") @db.Timestamptz
   deletedAt        DateTime?              @map("deleted_at") @db.Timestamptz
 
-  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation   Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   // Restrict, not Cascade: a message belongs to BOTH participants'
   // shared history, not solely to its sender the way a Post belongs
   // solely to its author — hard-deleting the sender's user row must not
@@ -879,16 +966,39 @@ model Message {
   // database.md §9's own 90-day deleted_at-then-purge/tombstone process
   // (ADR-003 §5) is the correct, explicit path for removing a departed
   // user's messages, not an FK-cascade side-effect.
-  sender         User         @relation("MessageSender", fields: [senderId], references: [id], onDelete: Restrict)
+  sender         User                @relation("MessageSender", fields: [senderId], references: [id], onDelete: Restrict)
   // Restrict, matching Comment.parentComment's existing precedent for
   // the same self-referencing-reply shape.
-  replyToMessage Message?     @relation("MessageReplies", fields: [replyToMessageId], references: [id], onDelete: Restrict)
-  replies        Message[]    @relation("MessageReplies")
+  replyToMessage Message?            @relation("MessageReplies", fields: [replyToMessageId], references: [id], onDelete: Restrict)
+  replies        Message[]           @relation("MessageReplies")
+  attachments    MessageAttachment[]
 
   @@unique([senderId, clientMessageId])
   @@index([conversationId, createdAt, id])
   @@index([senderId, createdAt])
   @@map("messages")
+  @@schema("messaging")
+}
+
+// Media increment (docs/04-database/media.md §4): image-only for MVP
+// (PRD §19 / architecture.md §14) — enforced at the application write
+// path, not a DB CHECK (Postgres cannot read another table's column in a
+// CHECK without a trigger, and none is used elsewhere in this schema for
+// a cross-table invariant). No altText column: PRD does not describe
+// alt text for message images, unlike post images.
+model MessageAttachment {
+  messageId    String   @map("message_id") @db.Uuid
+  assetId      String   @map("asset_id") @db.Uuid
+  displayOrder Int      @default(0) @map("display_order")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  asset   Asset   @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@id([messageId, assetId])
+  @@index([messageId, displayOrder])
+  @@index([assetId])
+  @@map("message_attachments")
   @@schema("messaging")
 }
 
@@ -947,17 +1057,17 @@ model Notification {
 }
 
 model NotificationPreference {
-  userId    String   @map("user_id") @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
   // Not enums: channels and categories are both still open decisions
   // (push/email/SMS channels; no approved category list).
-  category  String
-  channel   String
+  category        String
+  channel         String
   // No default on purpose: channels beyond in-app require consent (PRD
   // §20), so a wrong implicit "true" would be a consent bug. A row is only
   // written when the user (or the app on their behalf) makes an explicit
   // choice; absence of a row means "use the defaults in
   // social.user_preferences.notification_defaults".
-  enabled   Boolean
+  enabled         Boolean
   // Optional per-(category, channel) overrides listed in database.md
   // §10. NULL = inherit from the single source of truth
   // (social.user_preferences.quiet_hours_* / identity.users.locale) so
@@ -965,8 +1075,8 @@ model NotificationPreference {
   locale          String?
   quietHoursStart String?  @map("quiet_hours_start") // "HH:MM", app-validated, like social.user_preferences
   quietHoursEnd   String?  @map("quiet_hours_end")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -976,6 +1086,185 @@ model NotificationPreference {
   @@id([userId, category, channel])
   @@map("preferences")
   @@schema("notification")
+}
+
+// ============================================================
+// media schema — docs/04-database/database.md §11,
+// docs/04-database/media.md (concrete design, owner decisions 2026-09-22)
+// SCHEMA DRAFT — see the header comment block above for the full list of
+// Media-increment decisions. Not yet migrated.
+// ============================================================
+
+enum AssetKind {
+  image
+  video
+
+  @@schema("media")
+}
+
+// Deliberately 4 values, not 5 — 'deleted' is NOT a state value here.
+// Soft delete is the separate `deletedAt` timestamp below, the same
+// two-track pattern as ContentStatus/CommunityMembershipStatus (a small
+// enumerated lifecycle status field, plus an independent deletedAt).
+enum AssetState {
+  pending
+  processing
+  ready
+  rejected
+
+  @@schema("media")
+}
+
+// Pre-publish automated safety check (architecture.md §16 step 4: "scan
+// where available") — gates whether an asset may ever reach `ready`.
+// Distinct from AssetModerationState (post-publish). media.md named this
+// field's purpose but did not enumerate its values — proposed here.
+enum AssetScanState {
+  pending
+  passed
+  failed
+  skipped // no scan provider available/applicable for this kind/environment
+
+  @@schema("media")
+}
+
+// Post-publish moderation outcome on an already-ready asset. Same
+// 3-value taxonomy as messaging.MessageModerationState, kept as its own
+// type — no cross-schema type reuse, same reasoning already applied
+// there ("each module owns its business rules").
+enum AssetModerationState {
+  active
+  hidden
+  removed
+
+  @@schema("media")
+}
+
+model Asset {
+  id               String               @id @default(uuid(7)) @db.Uuid
+  ownerUserId      String               @map("owner_user_id") @db.Uuid
+  kind             AssetKind
+  // Not an enum — architecture.md §16 explicitly anticipates new
+  // purposes being added later without a new pipeline (media.md §3).
+  // Starter vocabulary (app-validated, not DB-enforced): avatar | cover |
+  // post | message_attachment.
+  purpose          String
+  state            AssetState           @default(pending)
+  scanState        AssetScanState       @default(pending) @map("scan_state")
+  moderationState  AssetModerationState @default(active) @map("moderation_state")
+  // Never trust the client's declared MIME type (architecture.md §16,
+  // PRD §31) — only verifiedMimeType is authoritative for anything
+  // security- or processing-relevant.
+  declaredMimeType String               @map("declared_mime_type")
+  verifiedMimeType String?              @map("verified_mime_type")
+  byteSize         BigInt?              @map("byte_size")
+  checksum         String?
+  widthPx          Int?                 @map("width_px")
+  heightPx         Int?                 @map("height_px")
+  durationSeconds  Int?                 @map("duration_seconds") // video only, whole seconds — MVP scope has no need for sub-second precision
+  // Vendor-neutral (ADR-002 §13): an internal label such as
+  // "s3_compatible", never a literal provider name.
+  storageProvider  String               @map("storage_provider")
+  // Private object key — never a public URL (media.md §9/§11). The raw
+  // object this key names is never served directly; only ready Variant
+  // rows are referenceable (media.md §6).
+  storageKey       String               @map("storage_key")
+  createdAt        DateTime             @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime             @updatedAt @map("updated_at") @db.Timestamptz
+  readyAt          DateTime?            @map("ready_at") @db.Timestamptz
+  rejectedAt       DateTime?            @map("rejected_at") @db.Timestamptz
+  deletedAt        DateTime?            @map("deleted_at") @db.Timestamptz
+
+  owner               User                @relation("AssetOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  variants            Variant[]
+  upload              Upload?
+  postMedia           PostMedia[]
+  messageAttachments  MessageAttachment[]
+  avatarOfProfiles    Profile[]           @relation("ProfileAvatar")
+  avatarOfCommunities Community[]         @relation("CommunityAvatar")
+  coverOfCommunities  Community[]         @relation("CommunityCover")
+
+  @@index([ownerUserId, purpose, state, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([deletedAt])
+  @@map("assets")
+  @@schema("media")
+}
+
+// Small, closed, stable set — a single variant's own generation outcome,
+// independent of sibling variants (a thumbnail can succeed while a
+// medium resize fails). ADR-003's rule: "any table with a meaningful
+// lifecycle ... enumerates its status values explicitly."
+enum VariantState {
+  pending
+  ready
+  failed
+
+  @@schema("media")
+}
+
+model Variant {
+  id              String       @id @default(uuid(7)) @db.Uuid
+  assetId         String       @map("asset_id") @db.Uuid
+  // App-validated, not an enum — same expansion reasoning as
+  // Asset.purpose (media.md §6). Starter vocabulary: thumbnail | medium |
+  // display | playable.
+  variantName     String       @map("variant_name")
+  storageKey      String       @map("storage_key")
+  mimeType        String       @map("mime_type")
+  widthPx         Int?         @map("width_px")
+  heightPx        Int?         @map("height_px")
+  durationSeconds Int?         @map("duration_seconds") // playable video variant only
+  // Nullable: unknown until generation actually succeeds (state moves to
+  // ready) — same "known only once verified" pattern as Asset's own
+  // byteSize/checksum.
+  byteSize        BigInt?      @map("byte_size")
+  checksum        String?
+  state           VariantState @default(pending)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  // Added per owner decision (2026-09-22) though database.md §11's
+  // original field list didn't list it, for consistency with every other
+  // table and to track in-place regeneration of the same variantName.
+  updatedAt       DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([assetId, variantName])
+  @@map("variants")
+  @@schema("media")
+}
+
+// Small, closed, stable lifecycle for an upload reservation.
+enum UploadStatus {
+  reserved
+  completed
+  expired
+  failed
+
+  @@schema("media")
+}
+
+model Upload {
+  id               String       @id @default(uuid(7)) @db.Uuid
+  ownerUserId      String       @map("owner_user_id") @db.Uuid
+  assetId          String       @unique @map("asset_id") @db.Uuid
+  // Vendor-neutral: the storage provider's own multipart/resumable
+  // session identifier, opaque. "Resumable parts" (database.md §11) are
+  // tracked via this single provider-side session reference, not as
+  // separate per-part rows.
+  providerUploadId String?      @map("provider_upload_id")
+  expectedByteSize BigInt?      @map("expected_byte_size")
+  expectedChecksum String?      @map("expected_checksum")
+  status           UploadStatus @default(reserved)
+  expiresAt        DateTime     @map("expires_at") @db.Timestamptz
+  completedAt      DateTime?    @map("completed_at") @db.Timestamptz
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz
+
+  owner User  @relation("UploadOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([status, expiresAt])
+  @@map("uploads")
+  @@schema("media")
 }
 
 // ============================================================
@@ -1002,14 +1291,14 @@ model OutboxEvent {
 }
 
 model IdempotencyKey {
-  ownerId           String    @map("owner_id") @db.Uuid
-  key               String
-  commandType       String    @map("command_type")
+  ownerId            String   @map("owner_id") @db.Uuid
+  key                String
+  commandType        String   @map("command_type")
   requestFingerprint String   @map("request_fingerprint")
-  status            String
-  responsePayload   Json?     @map("response_payload")
-  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  expiresAt         DateTime  @map("expires_at") @db.Timestamptz
+  status             String
+  responsePayload    Json?    @map("response_payload")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
+  expiresAt          DateTime @map("expires_at") @db.Timestamptz
 
   @@id([ownerId, key, commandType])
   @@map("idempotency_keys")
