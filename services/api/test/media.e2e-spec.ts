@@ -234,13 +234,23 @@ describe('Media (e2e)', () => {
       expect(asset.state).toBe('processing');
     });
 
-    it('is idempotent: completing an already-completed upload is a 200 no-op, not an error', async () => {
+    it('is idempotent: completing an already-completed upload is a 200 no-op, not an error, and does not re-run completion side effects', async () => {
       const u = await registerUser();
       const { uploadId, assetId } = await initUpload(u);
       await post(u, `/media/uploads/${uploadId}/complete`).expect(200);
+      const firstCompletedAt = (await prisma.upload.findUniqueOrThrow({ where: { id: uploadId } })).completedAt;
+      expect(firstCompletedAt).not.toBeNull();
+
       const second = await post(u, `/media/uploads/${uploadId}/complete`).expect(200);
       expect(second.body.data).toEqual({ assetId, state: 'processing' });
       expect((await prisma.upload.findMany({ where: { id: uploadId } })).length).toBe(1);
+
+      // The no-op must be a real no-op: completedAt must not be overwritten by
+      // a second pass through the completion logic (it would be, if the
+      // idempotency short-circuit were ever removed — the rest of the
+      // handler is not itself idempotent-safe to repeat).
+      const afterSecond = await prisma.upload.findUniqueOrThrow({ where: { id: uploadId } });
+      expect(afterSecond.completedAt?.getTime()).toBe(firstCompletedAt!.getTime());
     });
 
     it('is 404 for a nonexistent upload', async () => {
