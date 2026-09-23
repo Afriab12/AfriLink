@@ -10,6 +10,47 @@
 # (Not started automatically — see setup notes for why.)
 
 services:
+  # S3-compatible object storage for local development/test only (docs/05-api/media.md
+  # §11 "Local Development"). Not a production vendor decision — ADR-002 §13 defers
+  # that. MinIO is the standard self-hosted way to develop against the S3 protocol
+  # without a real account; the API's S3 client (@aws-sdk/client-s3) talks to this
+  # identically to how it would talk to any real S3-compatible provider later — only
+  # the endpoint/credentials change.
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: afrilink_minio_dev
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-afrilink}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env — see .env.example}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - afrilink_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates the dev/test buckets, then exits. `mc mb --ignore-existing` is
+  # idempotent — safe to rerun on every `docker compose up`.
+  minio-init:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: afrilink_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-afrilink} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${MEDIA_BUCKET_NAME:-afrilink-media-dev} &&
+      mc mb --ignore-existing local/${MEDIA_TEST_BUCKET_NAME:-afrilink-media-test}
+      "
+    restart: "no"
+
   postgres:
     image: postgres:18-alpine
     container_name: afrilink_postgres_dev
@@ -31,3 +72,5 @@ services:
 volumes:
   afrilink_postgres_data:
     name: afrilink_postgres_data
+  afrilink_minio_data:
+    name: afrilink_minio_data

@@ -276,6 +276,8 @@ Notifications are created asynchronously from domain events.
 
 ## 16. Media/file architecture
 
+**Concrete designs now exist and extend this section without changing its shape:** the database design (`docs/04-database/media.md`, schema migrated and verified, commit `a546c34`) and the storage/API architecture (`docs/05-api/media.md`, design-only — no code, dependency, or package installed yet). Both documents restate and detail the six-step pipeline below; neither redesigns it.
+
 **MVP scope (ADR-002):** profile images, post images, and limited video uploads, with basic image/video validation and processing. Voice notes, live streaming, advanced short-video/reels infrastructure, and advanced video editing are explicitly out of MVP scope — the pipeline below is intentionally generic so those formats can be added later as new asset purposes/variants rather than a new pipeline.
 
 1. The API authorizes owner, purpose, type, size, and quota and creates a pending asset.

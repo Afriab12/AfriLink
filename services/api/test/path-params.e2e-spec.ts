@@ -82,6 +82,10 @@ const ROUTES: Route[] = [
   // "every UUID route" claim has no exceptions
   { method: 'DELETE', path: '/notifications/:id', unknown: 404 },
   { method: 'POST', path: '/notifications/:id/read', unknown: 404 },
+  // media
+  { method: 'POST', path: '/media/uploads/:uploadId/complete', unknown: 404 },
+  { method: 'GET', path: '/media/:assetId', unknown: 404 },
+  { method: 'DELETE', path: '/media/:assetId', unknown: 404 },
 ];
 
 // The parametrised routes that are NOT pure UUID routes: each accepts a UUID or another identifier
