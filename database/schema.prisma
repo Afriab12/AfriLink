@@ -6,8 +6,9 @@
 // Database Phase 2 scope (in progress): `community` (§8), `messaging`
 // (§9), `notification` (§10), `media` (§11, design in
 // docs/04-database/media.md — NOT YET MIGRATED, see that note below).
-// Moderation, audit, feed, and search are still NOT modeled here yet —
-// added incrementally, one module at a time, in later phases.
+// Audit, feed, and search are still NOT modeled here yet — added
+// incrementally, one module at a time, in later phases. `moderation`
+// (§12, design in docs/04-database/moderation.md) is now modeled below.
 //
 // Design source of truth: docs/04-database/database.md
 // Approved decisions: docs/10-decisions/decisions.md (ADR-001, ADR-003),
@@ -152,7 +153,7 @@ datasource db {
   provider   = "postgresql"
   // Connection URL moved to prisma7.config.ts (Prisma 7 no longer accepts
   // `url` directly in schema.prisma — see database/prisma7.config.ts).
-  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "notification", "media", "integration"]
+  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "notification", "media", "moderation", "integration"]
   extensions = [citext]
 }
 
@@ -223,6 +224,11 @@ model User {
   notificationPreferences      NotificationPreference[]
   ownedMediaAssets             Asset[]                  @relation("AssetOwner")
   mediaUploads                 Upload[]                 @relation("UploadOwner")
+  moderationReportsSubmitted   Report[]                 @relation("ReportReporter")
+  moderationCasesAssigned      Case[]                   @relation("CaseAssignedModerator")
+  moderationActionsTaken       Action[]                 @relation("ActionActor")
+  moderationAppealsSubmitted   Appeal[]                 @relation("AppealAppellant")
+  moderationAppealsReviewed    Appeal[]                 @relation("AppealReviewer")
 
   @@index([status, createdAt])
   @@index([deletedAt]) // deleted-at lifecycle queries, per database.md §4
@@ -1265,6 +1271,358 @@ model Upload {
   @@index([status, expiresAt])
   @@map("uploads")
   @@schema("media")
+}
+
+// ============================================================
+// moderation schema — docs/04-database/database.md §12,
+// design in docs/04-database/moderation.md
+// ============================================================
+
+enum ReportTargetType {
+  profile
+  post
+  comment
+  share
+  message
+  conversation
+  community
+
+  @@schema("moderation")
+}
+
+enum ReportReasonCode {
+  spam
+  harassment
+  hate
+  impersonation
+  scam_fraud
+  violence
+  sexual_content
+  misinformation
+  other
+
+  @@schema("moderation")
+}
+
+// 3 values, not 4: a mechanical same-reporter duplicate never reaches
+// `open` in the first place (the partial-unique dedup_key index, added in
+// the migration SQL, rejects the insert), so a `duplicate` status would
+// have no code path that ever sets it — moderation.md §15 item 1.
+enum ReportStatus {
+  open
+  under_review
+  closed
+
+  @@schema("moderation")
+}
+
+// Shared by Report/Case.queue, Action.scope, and Sanction.scope —
+// database.md §12 states this exact vocabulary for sanctions; reused
+// for case queues too rather than inventing a second taxonomy
+// (moderation.md §15 item 5).
+enum ModerationScope {
+  platform
+  community
+  content
+  messaging
+
+  @@schema("moderation")
+}
+
+enum CaseStatus {
+  open
+  in_review
+  closed
+
+  @@schema("moderation")
+}
+
+// `critical` is not invented: PRD §28 / architecture.md §20 use that
+// exact word ("critical safety/security cases prioritized faster").
+enum CasePriority {
+  low
+  normal
+  high
+  critical
+
+  @@schema("moderation")
+}
+
+// Each value grounded in an approved document: "user reporting" /
+// "automated filtering" (ADR-001 §2), "escalation" (architecture.md §17:
+// "Serious cases escalate to platform Moderation").
+enum CaseSource {
+  user_report
+  automated_signal
+  escalation
+
+  @@schema("moderation")
+}
+
+// Already approved verbatim — ADR-001 §2's exact list of what moderators
+// may do.
+enum ModerationActionType {
+  remove_content
+  restrict_content
+  warn_user
+  suspend_account
+  ban_account
+  restrict_community_participation
+
+  @@schema("moderation")
+}
+
+// No `withdrawn`: nothing approved names user-initiated appeal
+// withdrawal as an MVP feature (moderation.md §15 item 1).
+enum AppealState {
+  submitted
+  under_review
+  upheld
+  overturned
+
+  @@schema("moderation")
+}
+
+enum SanctionSubjectType {
+  user
+  community
+
+  @@schema("moderation")
+}
+
+// Exactly the 3 action types that produce ongoing state (suspend_account,
+// ban_account, restrict_community_participation) — remove_content/
+// restrict_content/warn_user are one-time and never reach this enum.
+// `community_restricted` covers both the `removed` and `banned`
+// CommunityMembershipStatus outcomes; which one applies lives on
+// CommunityMembership.status itself, not duplicated here
+// (moderation.md §15 item 2).
+enum SanctionType {
+  account_suspended
+  account_banned
+  community_restricted
+
+  @@schema("moderation")
+}
+
+enum SanctionState {
+  active
+  expired
+  revoked
+  superseded
+
+  @@schema("moderation")
+}
+
+model Report {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  reporterUserId String           @map("reporter_user_id") @db.Uuid
+  // Polymorphic, app-resolved — same pattern Notification.targetType/
+  // targetId already uses (moderation.md §3). No FK.
+  targetType     ReportTargetType @map("target_type")
+  targetId       String           @map("target_id") @db.Uuid
+  reasonCode     ReportReasonCode @map("reason_code")
+  description    String?
+  status         ReportStatus     @default(open)
+  dedupKey       String?          @map("dedup_key")
+  // Optional signal at intake; the case's own priority is authoritative.
+  priority       CasePriority?
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  resolvedAt     DateTime?        @map("resolved_at") @db.Timestamptz
+
+  reporter    User         @relation("ReportReporter", fields: [reporterUserId], references: [id], onDelete: Restrict)
+  caseReports CaseReport[]
+
+  // Added in the migration SQL, not expressible in Prisma's DSL:
+  // - CHECK (NOT (target_type = 'profile' AND target_id = reporter_user_id)) -- no self-report
+  // - Partial UNIQUE (dedup_key) WHERE status IN ('open','under_review')     -- same-reporter dedup only,
+  //   never cross-reporter (moderation.md §15 item 4 — consolidation happens via case_reports instead)
+  @@index([status, priority, createdAt(sort: Desc), id(sort: Desc)]) // reports by status (queue)
+  @@index([targetType, targetId]) // reports by target
+  @@index([reporterUserId, createdAt(sort: Desc)]) // reports by reporter
+  @@map("reports")
+  @@schema("moderation")
+}
+
+model Case {
+  id                  String          @id @default(uuid(7)) @db.Uuid
+  queue               ModerationScope
+  assignedModeratorId String?         @map("assigned_moderator_id") @db.Uuid
+  status              CaseStatus      @default(open)
+  priority            CasePriority    @default(normal)
+  // Structural placeholder — no SLA policy computes this yet.
+  slaDueAt            DateTime?       @map("sla_due_at") @db.Timestamptz
+  source              CaseSource
+  createdAt           DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime        @updatedAt @map("updated_at") @db.Timestamptz
+  // NOT a hard lock: a compensating action (e.g. from an overturned
+  // appeal) may still be appended to `actions` under an already-closed
+  // case — the FK doesn't check this column, so cases never need to
+  // "reopen." closed_at only records when routine triage concluded.
+  closedAt            DateTime?       @map("closed_at") @db.Timestamptz
+
+  assignedModerator User?        @relation("CaseAssignedModerator", fields: [assignedModeratorId], references: [id], onDelete: Restrict)
+  caseReports       CaseReport[]
+  actions           Action[]
+
+  // Added in the migration SQL:
+  // - CHECK ((status = 'closed') = (closed_at IS NOT NULL))              -- timestamp/status consistency
+  // - CHECK (status <> 'in_review' OR assigned_moderator_id IS NOT NULL) -- in_review implies an assignee
+  @@index([status, priority, createdAt(sort: Desc), id(sort: Desc)]) // general moderation queue
+  @@index([queue, status, priority, createdAt(sort: Desc)]) // per-queue tab
+  @@index([assignedModeratorId, status]) // cases by assignee
+  @@map("cases")
+  @@schema("moderation")
+}
+
+// Many reports consolidate into one case (case triage); a report never
+// belongs to more than one case at once (@@unique([reportId]) below) —
+// database.md §12 frames this as many-to-many, but that direction has no
+// clear product meaning, so it's narrowed here (moderation.md §3 review).
+// Asymmetric cascade matches the existing PostMedia/MessageAttachment
+// join-table pattern: Cascade on the owning-case side, Restrict on the
+// evidence (report) side.
+model CaseReport {
+  caseId    String   @map("case_id") @db.Uuid
+  reportId  String   @map("report_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  case   Case   @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  report Report @relation(fields: [reportId], references: [id], onDelete: Restrict)
+
+  @@id([caseId, reportId])
+  @@unique([reportId])
+  @@map("case_reports")
+  @@schema("moderation")
+}
+
+model Action {
+  id                 String               @id @default(uuid(7)) @db.Uuid
+  caseId             String               @map("case_id") @db.Uuid
+  // Null = system/automated action, no acting user — same reasoning as
+  // Notification.actorUserId.
+  actorId            String?              @map("actor_id") @db.Uuid
+  targetType         ReportTargetType     @map("target_type")
+  targetId           String               @map("target_id") @db.Uuid
+  actionType         ModerationActionType @map("action_type")
+  // Independently set from case.queue — usually matches, not constrained
+  // to (a case triaged in the content queue can still produce a
+  // platform-scope account action).
+  scope              ModerationScope
+  reasonCode         ReportReasonCode     @map("reason_code")
+  // Postgres native `interval` has no first-class Prisma scalar; seconds
+  // is a plain Int, consistent with the rest of this schema.
+  durationSeconds    Int?                 @map("duration_seconds")
+  startsAt           DateTime             @default(now()) @map("starts_at") @db.Timestamptz
+  endsAt             DateTime?            @map("ends_at") @db.Timestamptz
+  // Corrections are compensating actions, not destructive updates
+  // (database.md §12) — a new row pointing back at what it reverses.
+  reversalOfActionId String?              @map("reversal_of_action_id") @db.Uuid
+  createdAt          DateTime             @default(now()) @map("created_at") @db.Timestamptz
+  // No updatedAt — append-only by design (database.md §12); nothing here
+  // is ever updated or deleted after insert.
+
+  case       Case       @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  actor      User?      @relation("ActionActor", fields: [actorId], references: [id], onDelete: Restrict)
+  reversalOf Action?    @relation("ActionReversal", fields: [reversalOfActionId], references: [id], onDelete: Restrict)
+  reversedBy Action[]   @relation("ActionReversal")
+  appeals    Appeal[]
+  sanctions  Sanction[]
+
+  // Composite unique (superset of the PK) — lets `Appeal` hold a
+  // composite FK pinning its denormalized actionType against drift so it
+  // can never disagree with the action it references (schema-integrity
+  // fix, see Appeal.action below).
+  @@unique([id, actionType])
+  // Added in the migration SQL:
+  // - CHECK (ends_at IS NULL OR ends_at > starts_at)
+  // - CHECK (reversal_of_action_id IS NULL OR reversal_of_action_id <> id)
+  @@index([caseId])
+  @@index([targetType, targetId, createdAt(sort: Desc)]) // history of actions against a target (auditability)
+  @@index([actorId, createdAt(sort: Desc)]) // moderator activity / accountability (PRD §29)
+  @@map("actions")
+  @@schema("moderation")
+}
+
+model Appeal {
+  id              String               @id @default(uuid(7)) @db.Uuid
+  actionId        String               @map("action_id") @db.Uuid
+  // Denormalized snapshot of actions.actionType, DB-pinned via the
+  // composite FK below — cannot drift, since `actions` is append-only
+  // and this pair is enforced by a real foreign key, not app code.
+  actionType      ModerationActionType @map("action_type")
+  appellantUserId String               @map("appellant_user_id") @db.Uuid
+  statement       String
+  state           AppealState          @default(submitted)
+  reviewerId      String?              @map("reviewer_id") @db.Uuid
+  decision        String?
+  // Computed at creation from the 72h target (ADR-001 §2 / PRD §28) and
+  // stored as a concrete timestamp so it stays stable even if the policy
+  // number changes later.
+  appealDeadline  DateTime             @map("appeal_deadline") @db.Timestamptz
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz
+  decidedAt       DateTime?            @map("decided_at") @db.Timestamptz
+
+  // Composite FK, not a plain single-column one: (actionId, actionType)
+  // must match a real (id, actionType) pair on Action (via its
+  // @@unique([id, actionType]) above). This is what makes an
+  // inconsistent actionType impossible to insert at the database level —
+  // not merely discouraged by application code.
+  action    Action @relation(fields: [actionId, actionType], references: [id, actionType], onDelete: Restrict)
+  appellant User   @relation("AppealAppellant", fields: [appellantUserId], references: [id], onDelete: Restrict)
+  reviewer  User?  @relation("AppealReviewer", fields: [reviewerId], references: [id], onDelete: Restrict)
+
+  // Added in the migration SQL:
+  // - CHECK (action_type <> 'warn_user')                                    -- appeal eligibility, DB-enforced
+  // - CHECK ((state IN ('upheld','overturned')) = (decided_at IS NOT NULL)) -- terminal-state timestamp
+  // - CHECK (state NOT IN ('upheld','overturned') OR reviewer_id IS NOT NULL) -- a decision needs a reviewer
+  // - Partial UNIQUE (action_id) WHERE state IN ('submitted','under_review')  -- one active appeal per action
+  // reviewer_id <> the referenced action's actor_id is an approved
+  // APPLICATION-LAYER rule, not a DB constraint (Postgres CHECK cannot
+  // cross-reference another table) — no trigger, per explicit instruction.
+  @@index([state, appealDeadline]) // appeals awaiting review / SLA tracking
+  @@index([appellantUserId, createdAt(sort: Desc)]) // a user's own appeal history
+  @@map("appeals")
+  @@schema("moderation")
+}
+
+model Sanction {
+  id             String              @id @default(uuid(7)) @db.Uuid
+  subjectType    SanctionSubjectType @map("subject_type")
+  // Polymorphic, narrowed to the two subject kinds that have ongoing
+  // restriction states — no FK.
+  subjectId      String              @map("subject_id") @db.Uuid
+  scope          ModerationScope
+  sanctionType   SanctionType        @map("sanction_type")
+  reasonCode     ReportReasonCode    @map("reason_code")
+  sourceActionId String              @map("source_action_id") @db.Uuid
+  startsAt       DateTime            @default(now()) @map("starts_at") @db.Timestamptz
+  endsAt         DateTime?           @map("ends_at") @db.Timestamptz
+  // An appeal overturning sourceActionId transitions this to `revoked`
+  // (application-layer rule connecting Appeal.state to this column).
+  state          SanctionState       @default(active)
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime            @updatedAt @map("updated_at") @db.Timestamptz
+
+  sourceAction Action @relation(fields: [sourceActionId], references: [id], onDelete: Restrict)
+
+  // Added in the migration SQL:
+  // - CHECK (ends_at IS NULL OR ends_at > starts_at)
+  // - CHECK (                                                        -- action→sanction mapping enforced at
+  //     (sanction_type IN ('account_suspended','account_banned')        the DB level: no sanction_type can
+  //       AND subject_type = 'user') OR                                 ever pair with the wrong subject kind
+  //     (sanction_type = 'community_restricted' AND subject_type = 'community')
+  //   )
+  // - Partial UNIQUE (subject_type, subject_id, scope) WHERE state = 'active'
+  //   -- at most one ACTIVE sanction per subject+scope; escalation uses `superseded`, never a second active row
+  // - Partial INDEX (ends_at) WHERE state = 'active'
+  //   -- structural only, for a future expiry sweep; no sweep job exists yet (M-1-style, media.md precedent)
+  @@index([subjectType, subjectId, createdAt(sort: Desc)]) // full sanction history for a subject
+  @@index([sourceActionId])
+  @@map("sanctions")
+  @@schema("moderation")
 }
 
 // ============================================================
