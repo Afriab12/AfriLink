@@ -216,6 +216,86 @@ describe('Profiles (e2e)', () => {
         .expect(200);
     });
 
+    // OptionalJwtAuthGuard — request-time session/account-status check
+    // (mirrors JwtAuthGuard's, but falls back to anonymous instead of
+    // rejecting, matching this guard's documented "never rejects" contract).
+    it('treats a suspended follower as an anonymous viewer, hiding a followers-only profile they would otherwise be allowed to see', async () => {
+      const owner = await registerUser();
+      const follower = await registerUser();
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/me/profile')
+        .set('Cookie', cookieHeader(owner.cookies, 'afrilink_at', 'afrilink_csrf'))
+        .set('X-CSRF-Token', owner.cookies['afrilink_csrf'])
+        .send({ visibility: 'followers' })
+        .expect(200);
+      await prisma.follow.create({ data: { followerId: follower.userId, followeeId: owner.userId } });
+
+      // Confirms the follow relationship really does grant access while
+      // the follower's own account is still active (isolates what this
+      // test is actually about: only the *follower's* status changes
+      // below, never the owner/target's — that's a separate, already-
+      // covered code path in profile-visibility.service.ts).
+      await request(app.getHttpServer())
+        .get(`/api/v1/profiles/${owner.userId}`)
+        .set('Cookie', cookieHeader(follower.cookies, 'afrilink_at'))
+        .expect(200);
+
+      await prisma.user.update({ where: { id: follower.userId }, data: { status: 'suspended' } });
+
+      // Same still-valid access token and session, same real follow row —
+      // but the follower's account is no longer active, so the guard must
+      // not recognize them, and a followers-only profile hides from an
+      // anonymous viewer regardless of any follow relationship on record.
+      await request(app.getHttpServer())
+        .get(`/api/v1/profiles/${owner.userId}`)
+        .set('Cookie', cookieHeader(follower.cookies, 'afrilink_at'))
+        .expect(404);
+    });
+
+    it('treats a request with a revoked session as anonymous, hiding a private profile even for the owner', async () => {
+      const owner = await registerUser();
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/me/profile')
+        .set('Cookie', cookieHeader(owner.cookies, 'afrilink_at', 'afrilink_csrf'))
+        .set('X-CSRF-Token', owner.cookies['afrilink_csrf'])
+        .send({ visibility: 'private' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/logout')
+        .set('Cookie', cookieHeader(owner.cookies, 'afrilink_at', 'afrilink_csrf'))
+        .set('X-CSRF-Token', owner.cookies['afrilink_csrf'])
+        .expect(200);
+
+      // Access token is still cryptographically valid and unexpired — only
+      // the session behind it was revoked.
+      await request(app.getHttpServer())
+        .get(`/api/v1/profiles/${owner.userId}`)
+        .set('Cookie', cookieHeader(owner.cookies, 'afrilink_at'))
+        .expect(404);
+    });
+
+    it('a public profile is unaffected: a suspended viewer can still read a public profile, just anonymously', async () => {
+      const target = await registerUser();
+      await request(app.getHttpServer())
+        .patch('/api/v1/me/profile')
+        .set('Cookie', cookieHeader(target.cookies, 'afrilink_at', 'afrilink_csrf'))
+        .set('X-CSRF-Token', target.cookies['afrilink_csrf'])
+        .send({ displayName: 'Still Public' })
+        .expect(200);
+
+      const viewer = await registerUser();
+      await prisma.user.update({ where: { id: viewer.userId }, data: { status: 'suspended' } });
+
+      const res = await request(app.getHttpServer())
+        .get(`/api/v1/profiles/${target.userId}`)
+        .set('Cookie', cookieHeader(viewer.cookies, 'afrilink_at'))
+        .expect(200);
+      expect(res.body.data.displayName).toBe('Still Public');
+    });
+
     it('hides a followers-only profile until an active follow row exists', async () => {
       const owner = await registerUser();
       const follower = await registerUser();

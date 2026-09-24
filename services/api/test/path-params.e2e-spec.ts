@@ -130,9 +130,12 @@ function call(app: INestApplication, r: Route, id: string, headers: Record<strin
 
 // ================================================================================================
 // A. The request boundary: with a database that EXPLODES if touched.
-//    PrismaService is replaced by a tripwire, and the access token is minted directly (the JWT
-//    guard verifies the signature only, no database). So a 422 here proves the request was
-//    rejected before any business or database logic ran.
+//    PrismaService is replaced by a tripwire, and the access token is minted directly. JwtAuthGuard
+//    itself now does one legitimate, expected database lookup on every authenticated request (the
+//    request-time session/account-status check) — the tripwire allowlists exactly that one access
+//    (`.session`, stubbed to resolve as a valid active session) and still explodes on anything else.
+//    So a 422 here still proves the request was rejected before any BUSINESS/route-handler database
+//    logic ran, which is what T-1 actually guarantees — not that authentication itself is DB-free.
 // ================================================================================================
 
 describe('Path parameter validation at the request boundary (T-1)', () => {
@@ -142,6 +145,7 @@ describe('Path parameter validation at the request boundary (T-1)', () => {
 
   beforeAll(async () => {
     dbHits = [];
+    const guardSessionId = randomUUID();
     const passthrough = new Set(['onModuleInit', 'onModuleDestroy', 'onApplicationBootstrap', 'onApplicationShutdown', 'beforeApplicationShutdown', 'then']);
     const tripwire = new Proxy(
       {},
@@ -149,6 +153,24 @@ describe('Path parameter validation at the request boundary (T-1)', () => {
         get(_target, prop) {
           if (prop === 'constructor') return Object;
           if (typeof prop === 'symbol' || passthrough.has(prop)) return undefined; // lifecycle probes
+          if (prop === 'session') {
+            // JwtAuthGuard's own request-time session/account-status check
+            // — legitimate on every authenticated request, not a T-1
+            // violation. Allowed *only* for a lookup by the token's own
+            // fixed sid (stubbed as a valid active session); any other
+            // session access — e.g. DELETE /auth/sessions/:id operating on
+            // a *different* session id — falls through to the ordinary
+            // tripwire below, unaffected and still provable as a real hit.
+            return {
+              findUnique: async (args: { where: { id: string } }) => {
+                if (args.where.id === guardSessionId) {
+                  return { revokedAt: null, expiresAt: new Date(Date.now() + 3_600_000), user: { status: 'active' } };
+                }
+                dbHits.push('session');
+                throw new Error('DATABASE TOUCHED through PrismaService.session');
+              },
+            };
+          }
           dbHits.push(prop);
           throw new Error(`DATABASE TOUCHED through PrismaService.${prop}`);
         },
@@ -162,7 +184,7 @@ describe('Path parameter validation at the request boundary (T-1)', () => {
     newApp(app);
     await app.init();
 
-    const token = new JwtService({ secret: process.env.JWT_ACCESS_SECRET }).sign({ sub: randomUUID(), sid: randomUUID() }, { expiresIn: '10m' });
+    const token = new JwtService({ secret: process.env.JWT_ACCESS_SECRET }).sign({ sub: randomUUID(), sid: guardSessionId }, { expiresIn: '10m' });
     const csrf = randomUUID();
     auth = { Cookie: `afrilink_at=${token}; afrilink_csrf=${csrf}`, 'X-CSRF-Token': csrf };
   });

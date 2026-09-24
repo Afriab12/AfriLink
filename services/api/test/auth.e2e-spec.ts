@@ -4,6 +4,7 @@ import { Test } from '@nestjs/testing';
 import cookieParser from 'cookie-parser';
 import request from 'supertest';
 import { randomUUID } from 'node:crypto';
+import { JwtService } from '@nestjs/jwt';
 import { AppModule } from '../src/app.module';
 import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 import { PrismaService } from '../src/common/prisma/prisma.service';
@@ -291,6 +292,88 @@ describe('Authentication (e2e)', () => {
 
       expect(Array.isArray(res.body.data)).toBe(true);
       expect(res.body.data.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  // JwtAuthGuard — request-time session/account-status enforcement.
+  // Proves the guard actually re-checks the database on every request,
+  // not just the JWT's own signature/expiry: a session revoked (or an
+  // account sanctioned) mid-token-life must stop working immediately,
+  // not after the access token naturally expires up to 15 minutes later.
+  describe('JwtAuthGuard — session/account-status enforcement', () => {
+    async function registerActive(): Promise<{ userId: string; cookies: Record<string, string> }> {
+      const email = uniqueEmail();
+      const res = await request(app.getHttpServer())
+        .post('/api/v1/auth/register')
+        .send({ email, password: 'correct-horse-battery-staple' })
+        .expect(201);
+      return { userId: res.body.data.user.id as string, cookies: extractCookies(res) };
+    }
+
+    it('rejects a request whose session was revoked by logout, even though the access token itself has not expired', async () => {
+      const { cookies } = await registerActive();
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/logout')
+        .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+        .set('X-CSRF-Token', cookies['afrilink_csrf'])
+        .expect(200);
+
+      // The access token is still cryptographically valid and unexpired —
+      // only the session behind it was revoked. A protected route must
+      // still reject it.
+      const res = await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions')
+        .set('Cookie', cookieHeader(cookies, 'afrilink_at'))
+        .expect(401);
+      expect(res.body.error.code).toBe('TOKEN_INVALID');
+    });
+
+    it.each(['restricted', 'suspended', 'banned', 'pending_deletion', 'deleted'] as const)(
+      'rejects a request from a %s account with 403 ACCOUNT_RESTRICTED, with a still-valid session and access token',
+      async (status) => {
+        const { userId, cookies } = await registerActive();
+        await prisma.user.update({ where: { id: userId }, data: { status } });
+
+        const res = await request(app.getHttpServer())
+          .get('/api/v1/auth/sessions')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at'))
+          .expect(403);
+        expect(res.body.error.code).toBe('ACCOUNT_RESTRICTED');
+      },
+    );
+
+    it('still allows a suspended account to log out (exempted route)', async () => {
+      const { userId, cookies } = await registerActive();
+      await prisma.user.update({ where: { id: userId }, data: { status: 'suspended' } });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/logout')
+        .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+        .set('X-CSRF-Token', cookies['afrilink_csrf'])
+        .expect(200);
+    });
+
+    it('still allows a banned account to log out everywhere (logout-all, exempted route)', async () => {
+      const { userId, cookies } = await registerActive();
+      await prisma.user.update({ where: { id: userId }, data: { status: 'banned' } });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/logout-all')
+        .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+        .set('X-CSRF-Token', cookies['afrilink_csrf'])
+        .expect(200);
+    });
+
+    it('rejects a well-formed, correctly-signed access token whose session id does not exist', async () => {
+      const jwtService = app.get(JwtService);
+      const fakeToken = jwtService.sign({ sub: randomUUID(), sid: randomUUID() }, { expiresIn: 900 });
+
+      const res = await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions')
+        .set('Cookie', `afrilink_at=${fakeToken}`)
+        .expect(401);
+      expect(res.body.error.code).toBe('TOKEN_INVALID');
     });
   });
 

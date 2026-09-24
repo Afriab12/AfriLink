@@ -12,6 +12,7 @@ import { clearAuthCookies, REFRESH_COOKIE, setAuthCookies } from './cookies.util
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { SkipAccountStatusCheck } from '../common/decorators/skip-account-status-check.decorator';
 import { TokenInvalidException } from '../common/errors/api-exception';
 import { RateLimit } from '../common/guards/rate-limit.decorator';
 import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
@@ -78,6 +79,7 @@ export class AuthController {
   @Post('logout')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
+  @SkipAccountStatusCheck()
   async logout(
     @CurrentUser() user: { sid: string },
     @Res({ passthrough: true }) res: Response,
@@ -90,6 +92,7 @@ export class AuthController {
   @Post('logout-all')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
+  @SkipAccountStatusCheck()
   async logoutAll(
     @CurrentUser() user: { sub: string },
     @Res({ passthrough: true }) res: Response,
