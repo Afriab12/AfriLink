@@ -220,7 +220,7 @@ Implements the contract `moderation.md` §7 proposed, with concrete call directi
 
 - A caller is "a moderator" if they hold an active (`revoked_at IS NULL`, not expired) `identity.user_roles` row whose `identity.roles.key = 'moderator'` — **exactly one platform role for MVP**, no `admin`/`senior_moderator`/`security_administrator` (`architecture.md` §11's full matrix remains a deferred, separate future decision, not pre-empted here). Reuses the existing, currently-empty RBAC tables unchanged — no schema change.
 - Enforced by a new, shared `PlatformRoleGuard` + `@RequireRole('moderator')`, composed *after* `JwtAuthGuard` (authentication + account/session enforcement) and *before* `ModerationAccessService` (resource-level checks) — a fixed four-layer sequence, no layer merged into another. No JWT role claim; a fresh database lookup on every role-gated request, so revocation takes effect on the very next request.
-- First-privileged-user bootstrap: a version-controlled seed script, run by a trusted operator per environment — never an API endpoint.
+- Role assignment: operator-only for MVP, no in-app grant/revoke API at all (not just for the first grant) — the role's *existence* is seeded (`database/seeds/roles.seed.ts`), but every actual *grant* is a trusted operator's direct database action, per `platform-role-authorization.md` §5.
 
 **None of this is implementable today** — the guard, decorator, and seed script don't exist yet. This is the single largest blocker to actual Moderation API implementation — see Implementation Dependencies §15.
 
@@ -307,7 +307,7 @@ Generated the same way as every other module — `buildOpenApiDocument()` picks 
 
 In dependency order — nothing below can be skipped by implementing Moderation "around" it:
 
-1. **Platform role mechanism** (§8, full design `docs/05-api/platform-role-authorization.md`) — a `moderator` `Role` seed, a way to grant `UserRole` rows, and a new shared `PlatformRoleGuard`. Design owner-approved 2026-09-24; **nothing built yet**, still blocks every `/moderation/*` route.
+1. **Platform role mechanism** (§8, full design `docs/05-api/platform-role-authorization.md`) — the `moderator` `Role` seed and `PlatformRoleGuard`/`@RequireRole()` are both **done and shipped** (commits `6292334`, `af359b2`). **Still blocking:** no user holds the `moderator` role yet — role assignment is operator-only for MVP (no in-app grant/revoke API, per `platform-role-authorization.md` §5), so this requires a trusted operator's direct database action, not more application code.
 2. ~~`JwtAuthGuard` request-time status re-check~~ — **done** (commit `a267312`). No longer a blocker.
 3. **`applyAccountSanction`/`liftAccountSanction`** (§9) — the guard now enforces status/session correctly, but nothing sets `User.status` or triggers `logoutAll` from outside Auth yet.
 4. **The account-appeal credential mechanism** (§5, Decision #14/Option B) — a new `verification_challenges` `purpose` + a small issue/consume service + `POST /moderation/account-appeals`. Blocks `suspend_account`/`ban_account` from being *appealable*, even once item 3 makes them *enforceable*.
