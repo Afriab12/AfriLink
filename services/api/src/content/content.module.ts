@@ -9,6 +9,7 @@ import { CommentsService } from './comments.service';
 import { ReactionsService } from './reactions.service';
 import { SharesService } from './shares.service';
 import { PostAccessService } from './post-access.service';
+import { ContentModerationService } from './content-moderation.service';
 import { ProfilesModule } from '../profiles/profiles.module';
 import { CommunitiesModule } from '../communities/communities.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -34,9 +35,15 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
     ReactionsService,
     SharesService,
     PostAccessService,
+    ContentModerationService,
     JwtAuthGuard,
     OptionalJwtAuthGuard,
     CsrfGuard,
   ],
+  // ContentModerationService is the §7 cross-module contract surface —
+  // exported so Moderation (once it exists) can import ContentModule and
+  // inject it, same boundary MediaAccessService/CommunityAccessService
+  // already export for their own consumers.
+  exports: [ContentModerationService],
 })
 export class ContentModule {}
