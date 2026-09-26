@@ -4,6 +4,7 @@ import { CommunitiesController } from './communities.controller';
 import { CommunitiesService } from './communities.service';
 import { MembershipsService } from './memberships.service';
 import { CommunityAccessService } from './community-access.service';
+import { CommunityModerationService } from './community-moderation.service';
 import { ProfilesModule } from '../profiles/profiles.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
@@ -18,9 +19,13 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
     }),
   ],
   controllers: [CommunitiesController],
-  providers: [CommunitiesService, MembershipsService, CommunityAccessService, JwtAuthGuard, OptionalJwtAuthGuard, CsrfGuard],
+  providers: [CommunitiesService, MembershipsService, CommunityAccessService, CommunityModerationService, JwtAuthGuard, OptionalJwtAuthGuard, CsrfGuard],
   // The Content module needs the same membership rules to gate posting and
-  // to apply the community audience on reads.
-  exports: [CommunityAccessService],
+  // to apply the community audience on reads. CommunityModerationService is
+  // the §7 cross-module contract surface — exported so Moderation (once it
+  // exists) can import CommunitiesModule and inject it, same boundary
+  // ContentModule/MessagingModule already export their own moderation
+  // services through.
+  exports: [CommunityAccessService, CommunityModerationService],
 })
 export class CommunitiesModule {}
