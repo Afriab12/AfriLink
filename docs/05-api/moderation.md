@@ -174,6 +174,52 @@ Per-type `details` and validation:
 - **Response:** identical shape to the normal appeal-creation response (`201`, the created `Appeal` row) — from the caller's perspective past this one entry point, everything else about appeals (moderator review, `decide`) is unchanged. **How the decision itself reaches the appellant is not the same for every appeal type — see the subsection immediately below.**
 - **Ruled out for MVP (Decision #14/Q3):** Option C (preserving a scoped session for appeal-only access) — would require reopening `JwtAuthGuard`/`Session` semantics, which this document does not propose and which was explicitly excluded from this decision round.
 
+#### As implemented — `POST /api/v1/moderation/account-appeals`
+
+**Public route — no `JwtAuthGuard`.** Rate-limited (`RateLimit(5, 3_600_000)`, the same shared, already-global `RateLimitGuard` every other public Auth route uses — no second rate-limiting mechanism).
+
+**Request body — exactly three fields, nothing else:**
+
+```json
+{
+  "credential": "<challengeId>.<verificationCode>",
+  "actionId": "01J...",
+  "statement": "..."
+}
+```
+
+No `userId`, `email`, `phone`, or `channel` field exists in this contract, deliberately — the credential alone resolves the caller's identity, so there is nothing for a client to supply that could ever disagree with it. `statement` is required, 1–2000 characters.
+
+**Credential format — resolves the earlier-open identity-binding question (§4 of the Account Appeal Credential Flow design review) as Option B:** the credential is a single composite string, `${challengeId}.${verificationCode}` — not a bare hash lookup. The server splits on the first `.`, validates the `challengeId` portion is a well-formed UUID, and performs an indexed primary-key lookup (`VerificationChallenge.findUnique`) rather than a table-wide `challengeHash` scan. This also means the credential reuses the existing `attemptCount`/max-attempts protection unchanged (identical in shape to `verify()`'s own) — a wrong-code guess against a real `challengeId` increments that row's `attemptCount` exactly as it already does for email/phone verification and password reset.
+
+**Credential semantics:**
+- `purpose = 'account_appeal'` is enforced on every lookup — a valid `password_reset`/`account_verification` credential (same hashing mechanism) is never accepted here.
+- One-time: consumed (`consumedAt` set) atomically with Appeal creation, never independently.
+- Expires: same 72h window as the appeal review deadline itself (`AccountSanctionService`'s `APPEAL_CHALLENGE_TTL_MS`), not the shorter 15-minute window used for email/phone verification and password reset — this credential is the sanctioned user's sole route back in for as long as the appeal window is open.
+- Attempt-limited: shares the existing `MAX_VERIFICATION_ATTEMPTS` policy value (5).
+- **Not** a login credential, **not** a session credential (never sets a cookie, never populates `request.user`), **not** bound to a specific action or sanction (unchanged from Decision #14/Q2 above).
+
+**Identity binding:**
+
+```
+credential → VerificationChallenge (by id, purpose=account_appeal) → userId
+actionId   → Action                                                → targetType / targetId
+```
+
+The request is accepted only if `Action.targetType = 'profile'` **and** `Action.targetId` equals the credential-resolved `userId`. Any mismatch — the action doesn't exist, or exists but belongs to someone else — returns the identical `404 RESOURCE_NOT_FOUND`, never a `403`, never a distinguishing message. Every other credential-resolution failure (malformed, wrong code, expired, consumed, wrong purpose, attempts exhausted) collapses to the same generic `401 TOKEN_INVALID`, matching `login()`'s existing non-enumerating convention.
+
+**Appealable actions:** only `Action.actionType ∈ {suspend_account, ban_account}` — any other actionType is `422 POLICY_REJECTED`. The Sanction sourced from that action (`Sanction.sourceActionId`) must still be `state = 'active'`; an already-lifted/revoked/superseded sanction (or no sanction row at all, which should not happen for these two actionTypes) is also `422 POLICY_REJECTED` — a stale-but-unconsumed credential issued while sanctioned must not remain usable once the underlying sanction has been resolved through some other path (e.g. a moderator reversal).
+
+**Appeal deadline:** `appealDeadline = now() + 72h`, computed server-side at creation — the same policy number as the normal, session-based appeal route (ADR-001 §2/PRD §28), not a new configuration value.
+
+**Re-submission policy:** any existing `Appeal` row for the same `actionId`, in **any** state, blocks a new submission with `409 CONFLICT` — not only the DB's own partial-unique constraint (which covers `submitted`/`under_review` only). A previously-decided appeal (`state = 'upheld'` or `'overturned'`, the schema's real terminal states — no new state introduced) cannot simply be resubmitted for the same action.
+
+**Transaction behavior:** credential consumption and `Appeal` creation happen inside exactly one transaction. A failed `Appeal` creation (including losing a race against the partial-unique constraint) rolls the whole transaction back — the credential is never left consumed without a corresponding appeal existing.
+
+**Error codes** use the existing, already-implemented conventions exactly — `422 VALIDATION_FAILED` with a `details[]` array for malformed requests (not `VALIDATION_ERROR`, not a single `field`), `401 TOKEN_INVALID`, `404 RESOURCE_NOT_FOUND`, `422 POLICY_REJECTED`, `409 CONFLICT`.
+
+**Delivery-path status — a real gap, not fixed here:** `applyAccountSanction` generates the raw code and computes `challengeHash = sha256(code)` before storing it, and `VerificationChallenge.create()`'s return value always carries the row's generated `id` — so constructing `${challengeId}.${code}` is trivially possible at the exact point of issuance, without ever persisting the raw code. But **nothing currently captures that return value or delivers the composite string anywhere** — this codebase has no real email/SMS provider for *any* challenge purpose yet (the same gap `register()`/`forgotPassword()` already have, masked only by a `devOnlyCode` field that is never present in production). The smallest future change is a one-line addition inside `applyAccountSanction`'s loop to capture and hand off the composite string; the actual send integration is a separate, already-tracked gap (the Notifications producer / a real delivery provider), not solved by this increment.
+
 ### Decision-outcome delivery — account-level appeals need the credential-channel, not in-app Notifications
 
 **The gap:** `.../decide` (above) records the outcome, but *reaching* the appellant with it is not the same problem for every appeal type, and treating them identically would silently break for the one case that matters most.

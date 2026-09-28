@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { AccountSanctionService } from './account-sanction.service';
+import { sha256 } from './token.util';
 
 // Unit-level (no HTTP layer, direct PrismaService instantiation — same
 // pattern as content-moderation.service.spec.ts/messaging-moderation.service.
@@ -340,6 +341,140 @@ describe('AccountSanctionService', () => {
       await expect(service.applyAccountSanction(randomUUID(), 'banned')).rejects.toMatchObject({ code: 'P2025' });
       const untouched = await prisma.user.findUniqueOrThrow({ where: { id: user.id } });
       expect(untouched.status).toBe('active');
+    });
+  });
+
+  // resolveAppealCredential/consumeAppealCredential back the Account Appeal
+  // Credential Flow (docs/05-api/moderation.md §5 "Account-sanction appeal
+  // initiation"). Fixtures construct VerificationChallenge rows directly
+  // with a known raw code rather than going through applyAccountSanction's
+  // real issuance — the raw code is a one-way hash input by design and is
+  // never observable after applyAccountSanction discards it, so a
+  // known-code fixture is the only way to exercise resolution/consumption
+  // at all (same reasoning already applied to every other challenge type
+  // in this codebase).
+  describe('resolveAppealCredential / consumeAppealCredential', () => {
+    const RAW_CODE = '482913';
+
+    async function makeAppealChallenge(
+      userId: string,
+      overrides: Partial<{ purpose: string; consumedAt: Date; expiresAt: Date; attemptCount: number; code: string }> = {},
+    ) {
+      const code = overrides.code ?? RAW_CODE;
+      return prisma.verificationChallenge.create({
+        data: {
+          userId,
+          channel: 'email',
+          destinationHash: sha256(`${randomUUID()}@example.com`),
+          purpose: overrides.purpose ?? 'account_appeal',
+          challengeHash: sha256(code),
+          expiresAt: overrides.expiresAt ?? new Date(Date.now() + 60 * 60 * 1000),
+          consumedAt: overrides.consumedAt ?? null,
+          attemptCount: overrides.attemptCount ?? 0,
+        },
+      });
+    }
+
+    describe('resolveAppealCredential', () => {
+      it('resolves a valid composite credential to { challengeId, userId }', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id);
+        const result = await service.resolveAppealCredential(`${challenge.id}.${RAW_CODE}`);
+        expect(result).toEqual({ challengeId: challenge.id, userId: user.id });
+      });
+
+      it('returns null for a wrong code', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id);
+        const result = await service.resolveAppealCredential(`${challenge.id}.000000`);
+        expect(result).toBeNull();
+      });
+
+      it('increments attemptCount on a wrong code, mirroring the existing verify() attempt-count protection', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id);
+        await service.resolveAppealCredential(`${challenge.id}.000000`);
+        const updated = await prisma.verificationChallenge.findUniqueOrThrow({ where: { id: challenge.id } });
+        expect(updated.attemptCount).toBe(1);
+      });
+
+      it('returns null once attemptCount has already reached the existing maximum, without incrementing further', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id, { attemptCount: 5 });
+        const result = await service.resolveAppealCredential(`${challenge.id}.${RAW_CODE}`);
+        expect(result).toBeNull();
+        const updated = await prisma.verificationChallenge.findUniqueOrThrow({ where: { id: challenge.id } });
+        expect(updated.attemptCount).toBe(5);
+      });
+
+      it('returns null for a malformed credential with no separator', async () => {
+        const result = await service.resolveAppealCredential('not-a-composite-credential');
+        expect(result).toBeNull();
+      });
+
+      it('returns null when the challenge-id portion is not a valid UUID', async () => {
+        const result = await service.resolveAppealCredential(`not-a-uuid.${RAW_CODE}`);
+        expect(result).toBeNull();
+      });
+
+      it('returns null for a nonexistent challenge id', async () => {
+        const result = await service.resolveAppealCredential(`${randomUUID()}.${RAW_CODE}`);
+        expect(result).toBeNull();
+      });
+
+      it('returns null for an expired challenge', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id, { expiresAt: new Date(Date.now() - 1000) });
+        const result = await service.resolveAppealCredential(`${challenge.id}.${RAW_CODE}`);
+        expect(result).toBeNull();
+      });
+
+      it('returns null for an already-consumed challenge', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id, { consumedAt: new Date() });
+        const result = await service.resolveAppealCredential(`${challenge.id}.${RAW_CODE}`);
+        expect(result).toBeNull();
+      });
+
+      it('returns null for the wrong purpose (e.g. a password_reset challenge, even with a correct hash)', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id, { purpose: 'password_reset' });
+        const result = await service.resolveAppealCredential(`${challenge.id}.${RAW_CODE}`);
+        expect(result).toBeNull();
+      });
+
+      it('is read-only with respect to consumption — resolving alone never sets consumedAt', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id);
+        await service.resolveAppealCredential(`${challenge.id}.${RAW_CODE}`);
+        const updated = await prisma.verificationChallenge.findUniqueOrThrow({ where: { id: challenge.id } });
+        expect(updated.consumedAt).toBeNull();
+      });
+    });
+
+    describe('consumeAppealCredential', () => {
+      it('sets consumedAt', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id);
+        await prisma.$transaction(async (tx) => {
+          await service.consumeAppealCredential(challenge.id, tx);
+        });
+        const updated = await prisma.verificationChallenge.findUniqueOrThrow({ where: { id: challenge.id } });
+        expect(updated.consumedAt).not.toBeNull();
+      });
+
+      it('rolls back with the rest of the transaction when the transaction fails after the call', async () => {
+        const user = await makeUser();
+        const challenge = await makeAppealChallenge(user.id);
+        await expect(
+          prisma.$transaction(async (tx) => {
+            await service.consumeAppealCredential(challenge.id, tx);
+            throw new Error('simulated failure after consumption');
+          }),
+        ).rejects.toThrow('simulated failure after consumption');
+        const unchanged = await prisma.verificationChallenge.findUniqueOrThrow({ where: { id: challenge.id } });
+        expect(unchanged.consumedAt).toBeNull();
+      });
     });
   });
 });

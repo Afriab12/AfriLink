@@ -1,9 +1,15 @@
 import { Injectable } from '@nestjs/common';
+import { isUUID } from 'class-validator';
 import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { generateVerificationCode, sha256 } from './token.util';
 
 export type AccountSanctionStatus = 'suspended' | 'banned';
+
+export interface ResolvedAppealCredential {
+  challengeId: string;
+  userId: string;
+}
 
 // The cross-module surface docs/05-api/moderation.md §7 names as
 // "Moderation → Identity": applyAccountSanction executes suspend_account/
@@ -108,5 +114,83 @@ export class AccountSanctionService {
   async liftAccountSanction(userId: string, tx?: Prisma.TransactionClient): Promise<void> {
     const client = tx ?? this.prisma;
     await client.user.update({ where: { id: userId }, data: { status: 'active' } });
+  }
+
+  // Mirrors AuthService's own MAX_VERIFICATION_ATTEMPTS (5) — that constant
+  // is private to auth.service.ts and AuthService is explicitly out of
+  // scope for this increment, so the value is duplicated here rather than
+  // exported. Keep in sync if the shared policy number ever changes.
+  private static readonly MAX_APPEAL_CREDENTIAL_ATTEMPTS = 5;
+
+  // Backs the Account Appeal Credential Flow (docs/05-api/moderation.md §5
+  // "Account-sanction appeal initiation"). The delivered credential is a
+  // single composite string, `${challengeId}.${rawCode}` — not a bare hash
+  // lookup — so an indexed PK read (findUnique by challengeId) does the
+  // work a table-wide challengeHash scan would otherwise need, and the
+  // existing per-row attemptCount/MAX_APPEAL_CREDENTIAL_ATTEMPTS protection
+  // (identical in shape to verify()'s own) still applies unchanged.
+  //
+  // Read-only with respect to the challenge's *consumption* — it never
+  // sets consumedAt, that is consumeAppealCredential's job alone, so a
+  // caller can validate before committing to spend the one-time credential.
+  // It is NOT read-only in an absolute sense: exactly like verify(), a
+  // wrong-code guess still increments attemptCount before returning null —
+  // that write cannot be deferred to a later step, since a wrong guess
+  // never reaches one. Preserving this existing attempt-count protection
+  // takes priority over a literal zero-writes reading of "read-only."
+  //
+  // Every distinct failure reason (malformed credential, not found, wrong
+  // purpose, expired, consumed, attempts exhausted, wrong code) collapses
+  // to the same `null` — the caller maps that uniformly to one generic
+  // invalid-credential response, never distinguishing which reason applied
+  // (matches login()'s existing non-enumerating convention).
+  async resolveAppealCredential(credential: string): Promise<ResolvedAppealCredential | null> {
+    const separatorIndex = credential.indexOf('.');
+    if (separatorIndex <= 0 || separatorIndex === credential.length - 1) {
+      return null;
+    }
+    const challengeId = credential.slice(0, separatorIndex);
+    const rawCode = credential.slice(separatorIndex + 1);
+    if (!isUUID(challengeId)) {
+      return null;
+    }
+
+    const challenge = await this.prisma.verificationChallenge.findUnique({ where: { id: challengeId } });
+    if (!challenge || challenge.purpose !== 'account_appeal') {
+      return null;
+    }
+    if (challenge.consumedAt !== null) {
+      return null;
+    }
+    if (challenge.expiresAt < new Date()) {
+      return null;
+    }
+    if (challenge.attemptCount >= AccountSanctionService.MAX_APPEAL_CREDENTIAL_ATTEMPTS) {
+      return null;
+    }
+
+    if (sha256(rawCode.trim()) !== challenge.challengeHash) {
+      await this.prisma.verificationChallenge.update({
+        where: { id: challengeId },
+        data: { attemptCount: { increment: 1 } },
+      });
+      return null;
+    }
+
+    return { challengeId: challenge.id, userId: challenge.userId };
+  }
+
+  // The sole consumption write, isolated from resolveAppealCredential so the
+  // caller (Moderation's future appeal-creation flow) can validate the
+  // Action/Sanction eligibility first and only then commit to spending the
+  // credential — inside the exact same transaction as the Appeal insert.
+  // `tx` is required, not optional like every sibling method's: this write
+  // only ever makes sense paired with an Appeal insert in one transaction,
+  // never standalone.
+  async consumeAppealCredential(challengeId: string, tx: Prisma.TransactionClient): Promise<void> {
+    await tx.verificationChallenge.update({
+      where: { id: challengeId },
+      data: { consumedAt: new Date() },
+    });
   }
 }
