@@ -86,6 +86,15 @@ const ROUTES: Route[] = [
   { method: 'POST', path: '/media/uploads/:uploadId/complete', unknown: 404 },
   { method: 'GET', path: '/media/:assetId', unknown: 404 },
   { method: 'DELETE', path: '/media/:assetId', unknown: 404 },
+  // moderation (Reports + Cases). GET /reports/:reportId needs only
+  // JwtAuthGuard (ownership-or-moderator is an in-service check); the four
+  // /moderation/cases routes additionally require PlatformRoleGuard +
+  // @RequireRole('moderator') — see the two special-cases this adds below.
+  { method: 'GET', path: '/reports/:reportId', unknown: 404 },
+  { method: 'GET', path: '/moderation/cases/:caseId', unknown: 404 },
+  { method: 'POST', path: '/moderation/cases/:caseId/assign', body: {}, unknown: 404 },
+  { method: 'PATCH', path: '/moderation/cases/:caseId', body: { priority: 'normal' }, unknown: 404 },
+  { method: 'POST', path: '/moderation/cases/:caseId/close', unknown: 404 },
 ];
 
 // The parametrised routes that are NOT pure UUID routes: each accepts a UUID or another identifier
@@ -170,6 +179,17 @@ describe('Path parameter validation at the request boundary (T-1)', () => {
                 throw new Error('DATABASE TOUCHED through PrismaService.session');
               },
             };
+          }
+          if (prop === 'userRole') {
+            // PlatformRoleGuard's own pre-check (moderation/cases routes) —
+            // equally legitimate/expected/non-business-logic as the session
+            // check above, not a T-1 violation. Stubbed to always resolve a
+            // grant so a malformed path id still reaches ParseUuidPipe
+            // rather than being pre-empted by a 403; this file already
+            // establishes that a role-gated route needs an authorized
+            // caller to exercise the *path-validation* boundary at all
+            // (an unauthorized caller's 403 would mask, not prove, T-1).
+            return { findFirst: async () => ({ id: 'stub-grant' }) };
           }
           dbHits.push(prop);
           throw new Error(`DATABASE TOUCHED through PrismaService.${prop}`);
@@ -361,6 +381,20 @@ describe('Valid UUIDs behave as they did before T-1 (real database)', () => {
     const c = extractCookies(res);
     userId = res.body.data.user.id as string;
     headers = { Cookie: `afrilink_at=${c['afrilink_at']}; afrilink_csrf=${c['afrilink_csrf']}`, 'X-CSRF-Token': c['afrilink_csrf'] };
+
+    // Granting this shared fixture user the moderator role is purely
+    // additive for the other ~40 routes in ROUTES (none of them are
+    // @RequireRole()-gated, so PlatformRoleGuard never runs for them) — it
+    // only changes behavior for the moderation/cases routes below, letting
+    // them reach business logic (and their documented `unknown` answer)
+    // instead of being pre-empted by PlatformRoleGuard's 403.
+    const prisma = app.get(PrismaService);
+    const role = await prisma.role.upsert({
+      where: { key: 'moderator' },
+      update: {},
+      create: { key: 'moderator', name: 'Moderator', description: 'test fixture' },
+    });
+    await prisma.userRole.create({ data: { userId, roleId: role.id } });
   });
 
   afterAll(async () => {

@@ -1,6 +1,6 @@
 # AfriLink Moderation API Design
 
-**Status:** DESIGN ONLY — proposed for owner review. No controller, service, DTO, module, guard, or route exists. No `schema.prisma`, migration, or dependency change accompanies this document. **Patched 2026-09-24 (same day, later revision):** `JwtAuthGuard`/`OptionalJwtAuthGuard` request-time session/account-status enforcement shipped (commit `a267312`, CI green) — §9 below is updated to reflect this as done, not proposed. All 13 original open questions plus the account-sanction appeal-reachability question (previously "#14") are now resolved by owner decision or existing-convention evidence — see **Decisions recorded** at the end of this document, which replaces the old "Open questions" section. Two items remain genuinely open (conversation-level appeal standing; exact message-removal-placeholder wording) and are marked as such there, not silently closed.
+**Status:** DESIGN ONLY for §4–§6 (Actions, Appeals beyond the account-appeal credential flow, Sanctions) — proposed for owner review, no controller/service/DTO/module/guard/route exists for that remaining surface. **Patched 2026-09-24 (same day, later revision):** `JwtAuthGuard`/`OptionalJwtAuthGuard` request-time session/account-status enforcement shipped (commit `a267312`, CI green) — §9 below is updated to reflect this as done, not proposed. All 13 original open questions plus the account-sanction appeal-reachability question (previously "#14") are now resolved by owner decision or existing-convention evidence — see **Decisions recorded** at the end of this document, which replaces the old "Open questions" section. Two items remain genuinely open (conversation-level appeal standing; exact message-removal-placeholder wording) and are marked as such there, not silently closed. **Patched 2026-09-28 (Moderation Increment A):** Reports (§2) and Cases (§3) are implemented — see each section's own "As implemented" subsection for what was built and what was resolved during implementation. No `schema.prisma`, migration, or dependency change accompanied that work.
 **Date:** 2026-09-24 (patched same day — see Status above)
 **Scope:** REST API design for `moderation.reports`, `.cases`, `.case_reports`, `.actions`, `.appeals`, `.sanctions` (schema committed `42fe6dd6`, applied to `afrilink_dev`), at the same level of detail `docs/05-api/media.md` was written at before Media's API was implemented.
 **Not in scope:** application code, DTOs-as-code, guards-as-code, schema/migration changes, dependency installs, Admin dashboard UI, Audit (`audit.events`), Feed, Search.
@@ -61,6 +61,14 @@ Never echoes `reporterUserId` back beyond what the caller already knows they are
 
 **Report status transitions — no direct endpoint.** `status` moves `open → under_review` when the report is linked into a case (§3), and `under_review → closed` when its case closes. **Decided:** derived-only, no direct moderator mutation endpoint — see Decisions recorded, item 1.
 
+#### As implemented — Reports (Moderation Increment A)
+
+All four endpoints above are implemented exactly as designed, with the following resolved during implementation:
+
+- **Target validation (approved during the Increment A implementation gate, not left as designed):** `POST /reports` validates target existence using each domain module's privileged, visibility-independent lookup — `ContentModerationService.resolveContentOwnerId` (`post`/`comment`/`share`), `MessagingModerationService.resolveMessageOwnerId` (`message`), `CommunityModerationService.resolveCommunityOwnerId` (`community`), and a direct, unfiltered `User`/`Conversation` lookup by id for `profile`/`conversation` (neither module exposes a dedicated privileged lookup for these two, and none was added — a raw existence check needs no ownership data). A target that exists but is not currently visible to the reporter (blocked, removed, private) is still reportable; a target that does not exist at all is `404 RESOURCE_NOT_FOUND`.
+- **`Idempotency-Key` is not implemented.** No `Idempotency-Key` mechanism exists anywhere in this codebase (the claim in this document's earlier revision that one does, matching a "follow/friend-request precedent," did not correspond to any real implementation — follow/friend-request achieve retry-safety through ordinary same-state-is-a-no-op application logic, not a client-supplied header checked against `integration.idempotency_keys`, which has zero consumers). `POST /reports`'s own `dedupKey` mechanism (already described above) is retry-safe on its own: a retried identical submission from the same reporter collapses onto the same `dedupKey` and is rejected with the same clean `409`, never a duplicate row. Building a first `Idempotency-Key` consumer was out of scope for this increment and was not attempted.
+- Cross-reporter reports against the same target remain fully independent, exactly as designed — never collapsed, never cross-visible.
+
 ## 3. Moderation cases / queue
 
 | Method | Path | Purpose | Auth |
@@ -81,6 +89,15 @@ Never echoes `reporterUserId` back beyond what the caller already knows they are
 **`PATCH /moderation/cases/{caseId}`:** `{ "priority": "high" }` only — an allowlisted single-field update, matching `api.md` §17's mass-assignment rule. `status`/`assignedModeratorId`/`queue` are never settable through this route; they have their own action endpoints or are set once at creation.
 
 **`POST /moderation/cases/{caseId}/close`:** sets `status=closed`, `closedAt=now()`. Does **not** require every linked report to have a terminal action — a case can close with "no violation found." On close, every linked report still `under_review` transitions to `closed`. Closing an already-closed case is a `200` no-op (idempotent, matching the repeat-action-is-a-no-op convention used throughout Communities/Notifications/Media). **Closing is not a hard lock** — `POST .../actions` on a closed case still succeeds (per the approved DB decision); the response for that case includes no special flag, since nothing in the schema distinguishes it.
+
+#### As implemented — Cases (Moderation Increment A)
+
+All six endpoints above are implemented exactly as designed, with the following resolved during implementation:
+
+- **Closed-case assignment protection (approved during the Increment A implementation gate):** `POST /moderation/cases/{caseId}/assign` rejects an already-closed case with `409 CONFLICT` rather than silently producing an assigned-but-closed case. Enforced with a conditional update (`WHERE status <> 'closed'`) rather than an explicit database lock — the row lock the `UPDATE` itself takes is what makes a concurrent assign/close race resolve to exactly one winner, with the loser seeing a clean `409` rather than a torn state.
+- **`GET /moderation/cases/{caseId}` reports linked reports using the moderator-only report shape** (including `reporterUserId`), since case detail is itself a moderator-only surface. `actions` is always `[]` — Actions (§4) are not implemented in this increment; this is a correct reflection of current state, not a placeholder.
+- **Priority updates are allowed on a closed case** — nothing in the schema ties `priority` to `status`, and this is consistent with "closing is not a hard lock" (previous paragraph). Not explicitly decided by the original design; recorded here as the implementation's resolution of that ambiguity rather than left silent.
+- Automatic case creation is not implemented — `POST /moderation/cases` (manual) remains the only creation path. An eventual automated trigger would call the same service method with `source: 'automated_signal'`; no trigger mechanism exists yet.
 
 ## 4. Moderation actions
 
