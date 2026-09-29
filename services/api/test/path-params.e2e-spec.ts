@@ -104,6 +104,10 @@ const ROUTES: Route[] = [
     body: { actionType: 'warn_user', targetType: 'profile', targetId: randomUUID(), reasonCode: 'spam' },
     unknown: 404,
   },
+  // moderation (Reversal) — the original action is looked up before any
+  // other table is touched, so a malformed/nonexistent actionId never
+  // reaches the target-lookup tables; no new tripwire allowlist entry needed.
+  { method: 'POST', path: '/moderation/actions/:actionId/reverse', body: { reasonCode: 'spam' }, unknown: 404 },
 ];
 
 // The parametrised routes that are NOT pure UUID routes: each accepts a UUID or another identifier

@@ -227,4 +227,156 @@ describe('Actions (e2e)', () => {
     expect(detail.body.data.actions[0].id).toBe(created.body.data.id);
     expect(detail.body.data.actions[0].sanctionId).toBe(created.body.data.sanctionId);
   });
+
+  // --------------------------------------------------------------- reversal
+
+  it('rejects an unauthenticated reversal request with 401', async () => {
+    await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${randomUUID()}/reverse`)
+      .send({ reasonCode: 'other' })
+      .expect(401);
+  });
+
+  it('rejects a non-moderator reversal request with 403', async () => {
+    const user = await registerUser();
+    const res = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${randomUUID()}/reverse`)
+      .set(auth(user))
+      .send({ reasonCode: 'other' })
+      .expect(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  it('rejects a mutation without a CSRF header with 403', async () => {
+    const moderator = await registerModerator();
+    await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${randomUUID()}/reverse`)
+      .set('Cookie', cookieHeader(moderator.cookies, 'afrilink_at', 'afrilink_csrf'))
+      .send({ reasonCode: 'other' })
+      .expect(403);
+  });
+
+  it('rejects a nonexistent action with 404', async () => {
+    const moderator = await registerModerator();
+    const res = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${randomUUID()}/reverse`)
+      .set(auth(moderator))
+      .send({ reasonCode: 'other' })
+      .expect(404);
+    expect(res.body.error.code).toBe('RESOURCE_NOT_FOUND');
+  });
+
+  it('rejects the original actor reversing their own action with 403', async () => {
+    const moderator = await registerModerator();
+    const target = await registerUser();
+    const kase = await makeCase();
+    const created = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/cases/${kase.id}/actions`)
+      .set(auth(moderator))
+      .send({ actionType: 'warn_user', targetType: 'profile', targetId: target.userId, reasonCode: 'spam' })
+      .expect(201);
+
+    const res = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${created.body.data.id}/reverse`)
+      .set(auth(moderator))
+      .send({ reasonCode: 'other' })
+      .expect(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  it('a different moderator reverses a ban: 201, User.status restored to active, sanctionId absent from the reversal response', async () => {
+    const actor = await registerModerator();
+    const reverser = await registerModerator();
+    const target = await registerUser();
+    const kase = await makeCase();
+    const created = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/cases/${kase.id}/actions`)
+      .set(auth(actor))
+      .send({ actionType: 'ban_account', targetType: 'profile', targetId: target.userId, reasonCode: 'harassment' })
+      .expect(201);
+
+    const res = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${created.body.data.id}/reverse`)
+      .set(auth(reverser))
+      .send({ reasonCode: 'other' })
+      .expect(201);
+
+    expect(res.body.data.reversalOfActionId).toBe(created.body.data.id);
+    expect(res.body.data.sanctionId).toBeUndefined();
+
+    const user = await prisma.user.findUniqueOrThrow({ where: { id: target.userId } });
+    expect(user.status).toBe('active');
+  });
+
+  it('reverses a content removal: post restored to published', async () => {
+    const actor = await registerModerator();
+    const reverser = await registerModerator();
+    const author = await registerUser();
+    const post = await makePost(author.userId);
+    const kase = await makeCase();
+    const created = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/cases/${kase.id}/actions`)
+      .set(auth(actor))
+      .send({ actionType: 'remove_content', targetType: 'post', targetId: post.id, reasonCode: 'spam' })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${created.body.data.id}/reverse`)
+      .set(auth(reverser))
+      .send({ reasonCode: 'other' })
+      .expect(201);
+
+    const reloaded = await prisma.post.findUniqueOrThrow({ where: { id: post.id } });
+    expect(reloaded.status).toBe('published');
+  });
+
+  it('rejects a second reversal of the same action with 409', async () => {
+    const actor = await registerModerator();
+    const reverser1 = await registerModerator();
+    const reverser2 = await registerModerator();
+    const target = await registerUser();
+    const kase = await makeCase();
+    const created = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/cases/${kase.id}/actions`)
+      .set(auth(actor))
+      .send({ actionType: 'warn_user', targetType: 'profile', targetId: target.userId, reasonCode: 'spam' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${created.body.data.id}/reverse`)
+      .set(auth(reverser1))
+      .send({ reasonCode: 'other' })
+      .expect(201);
+
+    const res = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${created.body.data.id}/reverse`)
+      .set(auth(reverser2))
+      .send({ reasonCode: 'other' })
+      .expect(409);
+    expect(res.body.error.code).toBe('CONFLICT');
+  });
+
+  it('rejects reversing a reversal with 422 POLICY_REJECTED', async () => {
+    const actor = await registerModerator();
+    const reverser1 = await registerModerator();
+    const reverser2 = await registerModerator();
+    const target = await registerUser();
+    const kase = await makeCase();
+    const created = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/cases/${kase.id}/actions`)
+      .set(auth(actor))
+      .send({ actionType: 'warn_user', targetType: 'profile', targetId: target.userId, reasonCode: 'spam' })
+      .expect(201);
+    const reversal = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${created.body.data.id}/reverse`)
+      .set(auth(reverser1))
+      .send({ reasonCode: 'other' })
+      .expect(201);
+
+    const res = await request(app.getHttpServer())
+      .post(`/api/v1/moderation/actions/${reversal.body.data.id}/reverse`)
+      .set(auth(reverser2))
+      .send({ reasonCode: 'other' })
+      .expect(422);
+    expect(res.body.error.code).toBe('POLICY_REJECTED');
+  });
 });

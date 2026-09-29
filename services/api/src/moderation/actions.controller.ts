@@ -2,6 +2,7 @@ import { Body, Controller, HttpCode, Param, Post, UseGuards } from '@nestjs/comm
 import { ApiTags } from '@nestjs/swagger';
 import { ActionsService, type ActionResponse } from './actions.service';
 import { CreateActionDto } from './dto/create-action.dto';
+import { ReverseActionDto } from './dto/reverse-action.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { PlatformRoleGuard } from '../common/guards/platform-role.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
@@ -27,5 +28,13 @@ export class ActionsController {
   @RequireRole('moderator')
   async create(@CurrentUser() user: Me, @Param('caseId', ParseUuidPipe) caseId: string, @Body() dto: CreateActionDto): Promise<{ data: ActionResponse }> {
     return { data: await this.actions.createAction(user.sub, caseId, dto) };
+  }
+
+  @Post('actions/:actionId/reverse')
+  @HttpCode(201)
+  @UseGuards(JwtAuthGuard, PlatformRoleGuard, CsrfGuard)
+  @RequireRole('moderator')
+  async reverse(@CurrentUser() user: Me, @Param('actionId', ParseUuidPipe) actionId: string, @Body() dto: ReverseActionDto): Promise<{ data: ActionResponse }> {
+    return { data: await this.actions.reverseAction(user.sub, actionId, dto) };
   }
 }

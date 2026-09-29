@@ -742,4 +742,313 @@ describe('ActionsService', () => {
       expect(activeCount).toBe(1);
     });
   });
+
+  // ================================================================= reversal
+
+  describe('reverseAction', () => {
+    it('throws ResourceNotFoundException for a nonexistent action', async () => {
+      const moderator = await makeUser();
+      await expect(service.reverseAction(moderator.id, randomUUID(), { reasonCode: 'other' })).rejects.toThrow(ResourceNotFoundException);
+    });
+
+    it('rejects the original actor reversing their own action (reviewer != actor)', async () => {
+      const moderator = await makeUser();
+      const target = await makeUser();
+      const kase = await makeCase();
+      const original = await service.createAction(moderator.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+      await expect(service.reverseAction(moderator.id, original.id, { reasonCode: 'other' })).rejects.toThrow(ForbiddenActionException);
+    });
+
+    describe('content', () => {
+      it('reverses remove_content: post restored to published', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const author = await makeUser();
+        const post = await makePost(author.id);
+        const kase = await makeCase('content');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'remove_content', targetType: 'post', targetId: post.id, reasonCode: 'spam' });
+
+        const reversal = await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        expect(reversal.reversalOfActionId).toBe(original.id);
+        expect(reversal.actionType).toBe('remove_content');
+        expect(reversal.sanctionId).toBeUndefined();
+
+        const reloaded = await prisma.post.findUniqueOrThrow({ where: { id: post.id } });
+        expect(reloaded.status).toBe('published');
+      });
+
+      it('reverses restrict_content: comment restored to published', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const author = await makeUser();
+        const comment = await makeComment(author.id);
+        const kase = await makeCase('content');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'restrict_content', targetType: 'comment', targetId: comment.id, reasonCode: 'spam' });
+
+        await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        const reloaded = await prisma.comment.findUniqueOrThrow({ where: { id: comment.id } });
+        expect(reloaded.status).toBe('published');
+      });
+
+      it('reverses a message removal: restored to active', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const sender = await makeUser();
+        const message = await makeMessage(sender.id);
+        const kase = await makeCase('messaging');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'remove_content', targetType: 'message', targetId: message.id, reasonCode: 'spam' });
+
+        await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        const reloaded = await prisma.message.findUniqueOrThrow({ where: { id: message.id } });
+        expect(reloaded.moderationState).toBe('active');
+      });
+
+      it('rejects the content owner reversing an action against their own content, even though they are not the original actor', async () => {
+        const actor = await makeUser();
+        const owner = await makeUser(); // also a moderator, distinct from actor
+        const post = await makePost(owner.id);
+        const kase = await makeCase('content');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'remove_content', targetType: 'post', targetId: post.id, reasonCode: 'spam' });
+
+        await expect(service.reverseAction(owner.id, original.id, { reasonCode: 'other' })).rejects.toThrow(ForbiddenActionException);
+      });
+    });
+
+    describe('warn_user', () => {
+      it('is an audit-only no-op: Action row created, no sanction, no functional effect', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase();
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        const reversal = await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        expect(reversal.reversalOfActionId).toBe(original.id);
+        expect(reversal.actionType).toBe('warn_user');
+        expect(reversal.sanctionId).toBeUndefined();
+
+        const user = await prisma.user.findUniqueOrThrow({ where: { id: target.id } });
+        expect(user.status).toBe('active');
+      });
+
+      it('rejects the warned user reversing their own warning', async () => {
+        const actor = await makeUser();
+        const target = await makeUser(); // also a moderator, distinct from actor
+        const kase = await makeCase();
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        await expect(service.reverseAction(target.id, original.id, { reasonCode: 'other' })).rejects.toThrow(ForbiddenActionException);
+      });
+    });
+
+    describe('account sanction', () => {
+      it('reverses a suspend: Sanction revoked, User.status restored to active', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'suspend_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        const reversal = await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        expect(reversal.actionType).toBe('suspend_account');
+
+        const sanction = await prisma.sanction.findUniqueOrThrow({ where: { id: original.sanctionId! } });
+        expect(sanction.state).toBe('revoked');
+        const user = await prisma.user.findUniqueOrThrow({ where: { id: target.id } });
+        expect(user.status).toBe('active');
+      });
+
+      it('reverses a ban: Sanction revoked, User.status restored to active', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        const user = await prisma.user.findUniqueOrThrow({ where: { id: target.id } });
+        expect(user.status).toBe('active');
+      });
+
+      it('does NOT restore sessions — liftAccountSanction (unmodified) never recreates them', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const session = await prisma.session.create({
+          data: { userId: target.id, refreshTokenHash: randomUUID(), expiresAt: new Date(Date.now() + 3_600_000) },
+        });
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        const sessionCountBeforeReversal = await prisma.session.count({ where: { userId: target.id, revokedAt: null } });
+        expect(sessionCountBeforeReversal).toBe(0); // the ban already revoked it
+
+        await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        const reloadedSession = await prisma.session.findUniqueOrThrow({ where: { id: session.id } });
+        expect(reloadedSession.revokedAt).not.toBeNull(); // still revoked — reversal restores status only, not sessions
+      });
+
+      it('allows creating a fresh active sanction after reversal frees the active-uniqueness slot', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+
+        const fresh = await service.createAction(actor.id, kase.id, { actionType: 'suspend_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        expect(fresh.sanctionId).toBeDefined();
+      });
+
+      it('rejects reversing an action whose sanction is no longer active (superseded by escalation)', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const suspendAction = await service.createAction(actor.id, kase.id, {
+          actionType: 'suspend_account',
+          targetType: 'profile',
+          targetId: target.id,
+          reasonCode: 'spam',
+        });
+        // escalate: suspend -> ban supersedes the suspend's sanction
+        await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        await expect(service.reverseAction(reverser.id, suspendAction.id, { reasonCode: 'other' })).rejects.toThrow(ConflictException);
+        // the currently-active ban must be untouched by the rejected reversal attempt
+        const user = await prisma.user.findUniqueOrThrow({ where: { id: target.id } });
+        expect(user.status).toBe('banned');
+      });
+
+      it('rejects the sanctioned user (still able to log in, e.g. via a later reversal) reversing their own sanction', async () => {
+        const actor = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        // Calling the service directly (not through HTTP/JwtAuthGuard) proves the
+        // service-level self-check holds even though a real banned caller could
+        // never reach this route in practice (JwtAuthGuard would reject them first).
+        await expect(service.reverseAction(target.id, original.id, { reasonCode: 'other' })).rejects.toThrow(ForbiddenActionException);
+      });
+    });
+
+    describe('community restriction', () => {
+      it('reverses a restriction: Sanction revoked, membership restored to active', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const owner = await makeUser();
+        const community = await makeCommunity(owner.id);
+        const membership = await makeMembership(community.id, target.id);
+        const kase = await makeCase('community');
+        const original = await service.createAction(actor.id, kase.id, {
+          actionType: 'restrict_community_participation',
+          targetType: 'profile',
+          targetId: target.id,
+          reasonCode: 'spam',
+          details: { communityId: community.id },
+        });
+
+        const reversal = await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        expect(reversal.actionType).toBe('restrict_community_participation');
+
+        const sanction = await prisma.sanction.findUniqueOrThrow({ where: { id: original.sanctionId! } });
+        expect(sanction.state).toBe('revoked');
+        const reloadedMembership = await prisma.communityMembership.findUniqueOrThrow({ where: { id: membership.id } });
+        expect(reloadedMembership.status).toBe('active');
+      });
+
+      it('rejects the restricted member (still able to authenticate) reversing their own restriction', async () => {
+        const actor = await makeUser();
+        const target = await makeUser();
+        const owner = await makeUser();
+        const community = await makeCommunity(owner.id);
+        await makeMembership(community.id, target.id);
+        const kase = await makeCase('community');
+        const original = await service.createAction(actor.id, kase.id, {
+          actionType: 'restrict_community_participation',
+          targetType: 'profile',
+          targetId: target.id,
+          reasonCode: 'spam',
+          details: { communityId: community.id },
+        });
+
+        await expect(service.reverseAction(target.id, original.id, { reasonCode: 'other' })).rejects.toThrow(ForbiddenActionException);
+      });
+    });
+
+    describe('reversal-of-reversal and duplicate reversal', () => {
+      it('rejects reversing an action that is itself a reversal', async () => {
+        const actor = await makeUser();
+        const reverser1 = await makeUser();
+        const reverser2 = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase();
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        const reversal = await service.reverseAction(reverser1.id, original.id, { reasonCode: 'other' });
+
+        await expect(service.reverseAction(reverser2.id, reversal.id, { reasonCode: 'other' })).rejects.toThrow(PolicyRejectedException);
+      });
+
+      it('performs the reversal Action insert and lift call inside exactly one $transaction call', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        const spy = vi.spyOn(prisma, '$transaction');
+        await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        expect(spy).toHaveBeenCalledTimes(1);
+        spy.mockRestore();
+      });
+
+      it('rejects a second reversal of the same original action with 409', async () => {
+        const actor = await makeUser();
+        const reverser1 = await makeUser();
+        const reverser2 = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase();
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        await service.reverseAction(reverser1.id, original.id, { reasonCode: 'other' });
+
+        await expect(service.reverseAction(reverser2.id, original.id, { reasonCode: 'other' })).rejects.toThrow(ConflictException);
+      });
+
+      it('two simultaneous reversal attempts on the same action: exactly one succeeds, one gets 409', async () => {
+        const actor = await makeUser();
+        const reverser1 = await makeUser();
+        const reverser2 = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase();
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        const [r1, r2] = await Promise.allSettled([
+          service.reverseAction(reverser1.id, original.id, { reasonCode: 'other' }),
+          service.reverseAction(reverser2.id, original.id, { reasonCode: 'other' }),
+        ]);
+        const outcomes = [r1, r2];
+        expect(outcomes.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        expect(outcomes.filter((r) => r.status === 'rejected')).toHaveLength(1);
+        expect((outcomes.find((r) => r.status === 'rejected') as PromiseRejectedResult).reason).toBeInstanceOf(ConflictException);
+
+        const reversalCount = await prisma.action.count({ where: { reversalOfActionId: original.id } });
+        expect(reversalCount).toBe(1);
+      });
+    });
+
+    describe('case status', () => {
+      it('reversal remains allowed on a closed case', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase();
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        await prisma.case.update({ where: { id: kase.id }, data: { status: 'closed', closedAt: new Date() } });
+
+        await expect(service.reverseAction(reverser.id, original.id, { reasonCode: 'other' })).resolves.toBeDefined();
+      });
+    });
+  });
 });

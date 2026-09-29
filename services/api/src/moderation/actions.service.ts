@@ -8,6 +8,7 @@ import { CommunityModerationService } from '../communities/community-moderation.
 import { AccountSanctionService } from '../auth/account-sanction.service';
 import { ConflictException, ForbiddenActionException, PolicyRejectedException, ResourceNotFoundException, ValidationFailedException } from '../common/errors/api-exception';
 import type { CreateActionDto } from './dto/create-action.dto';
+import type { ReverseActionDto } from './dto/reverse-action.dto';
 
 export interface ActionResponse {
   id: string;
@@ -23,6 +24,7 @@ export interface ActionResponse {
   endsAt: Date | null;
   createdAt: Date;
   sanctionId?: string;
+  reversalOfActionId?: string;
 }
 
 type ActionType = CreateActionDto['actionType'];
@@ -301,6 +303,129 @@ export class ActionsService {
     }
   }
 
+  // Reverses a prior action (moderation.md §4/§7, Decisions recorded item
+  // 5). reviewer != actor is the exact appeal-review rule reused, not
+  // reinvented. A reversal reuses the ORIGINAL action's own actionType —
+  // the schema has no separate "reversal" ModerationActionType — and is
+  // distinguished purely by reversalOfActionId being set (database.md §12:
+  // "corrections are compensating actions, not destructive updates").
+  //
+  // Approved decisions (owner review, this increment):
+  //  1. A sanction must be verified state='active' before any lift call;
+  //     a non-active sanction (superseded by escalation, or already
+  //     revoked) rejects the reversal outright with 409 — never a silent
+  //     no-op, since silently no-op'ing could look like success while
+  //     leaving a currently-enforced, unrelated sanction untouched.
+  //  2. Reversing a reversal is forbidden (422 POLICY_REJECTED) — a
+  //     correction of a correction must be a fresh new action instead.
+  //     A second reversal of the SAME original is 409 CONFLICT, made
+  //     race-safe with an advisory lock (no DB uniqueness exists on
+  //     reversalOfActionId, so this is the equivalent backstop
+  //     MembershipsService.serialised already established for the same
+  //     kind of gap).
+  //  3. warn_user reversal is an audit-only no-op — Action row only, no
+  //     Sanction ever existed for it, nothing else to undo.
+  //  4. reasonCode reuses the same ReportReasonCode vocabulary despite
+  //     the semantic mismatch (tracked as a follow-up, not fixed here).
+  //     No `notes` field — Action has no column to hold it; silently
+  //     accepting and discarding would be worse than not accepting it.
+  //  5. The self-action rule extends to reversal: a moderator may not
+  //     reverse an action whose target is themselves (or, for content,
+  //     whose target's owner is themselves) — independent of whether
+  //     they were the original actor.
+  //  6. Case status is never checked — closure is not a hard lock,
+  //     already established for creation, extended here without a fresh
+  //     decision.
+  async reverseAction(moderatorId: string, actionId: string, dto: ReverseActionDto): Promise<ActionResponse> {
+    const original = await this.prisma.action.findUnique({ where: { id: actionId } });
+    if (!original) {
+      throw new ResourceNotFoundException();
+    }
+    if (original.actorId === moderatorId) {
+      throw new ForbiddenActionException();
+    }
+    if (original.reversalOfActionId !== null) {
+      throw new PolicyRejectedException('A reversal cannot itself be reversed.');
+    }
+
+    await this.assertNotSelfTargeting(moderatorId, original.targetType as TargetType, original.targetId);
+
+    const reversal = await this.prisma.$transaction(async (tx) => {
+      // Serializes concurrent reversal attempts against the SAME original
+      // action. No DB uniqueness exists on reversalOfActionId, so this
+      // advisory lock is the race-safe backstop in its place.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`action-reversal:${actionId}`}, 0))`;
+
+      const existingReversal = await tx.action.findFirst({ where: { reversalOfActionId: actionId } });
+      if (existingReversal) {
+        throw new ConflictException('CONFLICT', 'This action has already been reversed.');
+      }
+
+      const sanction = await tx.sanction.findFirst({ where: { sourceActionId: actionId } });
+      if (sanction && sanction.state !== 'active') {
+        throw new ConflictException('CONFLICT', 'This sanction is no longer active and cannot be reversed.');
+      }
+
+      const created = await tx.action.create({
+        data: {
+          caseId: original.caseId,
+          actorId: moderatorId,
+          targetType: original.targetType,
+          targetId: original.targetId,
+          actionType: original.actionType,
+          scope: original.scope,
+          reasonCode: dto.reasonCode,
+          reversalOfActionId: original.id,
+        },
+      });
+
+      if (sanction) {
+        await tx.sanction.update({ where: { id: sanction.id }, data: { state: 'revoked' } });
+        if (sanction.subjectType === 'user') {
+          await this.accountSanction.liftAccountSanction(sanction.subjectId, tx);
+        } else {
+          await this.communityModeration.liftMembershipSanction(sanction.subjectId, tx);
+        }
+      } else if (original.actionType === 'remove_content' || original.actionType === 'restrict_content') {
+        if (original.targetType === 'message') {
+          await this.messagingModeration.applyMessageModerationStatus(original.targetId, 'active', tx);
+        } else {
+          await this.contentModeration.applyContentModerationStatus(original.targetType as 'post' | 'comment', original.targetId, 'published', tx);
+        }
+      }
+      // warn_user with no sanction: nothing else to undo.
+
+      return created;
+    });
+
+    return this.toResponse(reversal);
+  }
+
+  // Existence + self-targeting in one step for content/message targets
+  // (mirrors createContentAction's own reasoning: resolving the owner
+  // does double duty). Profile targets are compared directly — user
+  // existence is not re-verified at reversal time, matching the same
+  // "a caller that already validated moments earlier should never
+  // legitimately hit this" reasoning the creation paths already use.
+  private async assertNotSelfTargeting(moderatorId: string, targetType: TargetType, targetId: string): Promise<void> {
+    if (targetType === 'profile') {
+      if (targetId === moderatorId) {
+        throw new ForbiddenActionException();
+      }
+      return;
+    }
+    const ownerId =
+      targetType === 'message'
+        ? await this.messagingModeration.resolveMessageOwnerId(targetId)
+        : await this.contentModeration.resolveContentOwnerId(targetType as 'post' | 'comment', targetId);
+    if (ownerId === null) {
+      throw new ResourceNotFoundException();
+    }
+    if (ownerId === moderatorId) {
+      throw new ForbiddenActionException();
+    }
+  }
+
   private toResponse(action: Action, sanctionId?: string): ActionResponse {
     return {
       id: action.id,
@@ -316,6 +441,7 @@ export class ActionsService {
       endsAt: action.endsAt,
       createdAt: action.createdAt,
       ...(sanctionId && { sanctionId }),
+      ...(action.reversalOfActionId && { reversalOfActionId: action.reversalOfActionId }),
     };
   }
 }
