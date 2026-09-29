@@ -1,11 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import type { Case, CaseReport, Report } from '@prisma/client';
+import type { Action, Case, CaseReport, Report } from '@prisma/client';
 import { isUUID } from 'class-validator';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ConflictException, InvalidCursorException, PolicyRejectedException, ResourceNotFoundException, ValidationFailedException } from '../common/errors/api-exception';
 import { clampLimit, decodeCursor, toPage, type CursorPageResult } from '../common/pagination/cursor';
 import type { ModerationReportResponse } from './reports.service';
+import type { ActionResponse } from './actions.service';
 import type { CreateCaseDto } from './dto/create-case.dto';
 import type { AssignCaseDto } from './dto/assign-case.dto';
 import type { UpdateCasePriorityDto } from './dto/update-case-priority.dto';
@@ -26,10 +27,7 @@ export interface CaseSummaryResponse {
 
 export interface CaseDetailResponse extends CaseSummaryResponse {
   reports: ModerationReportResponse[];
-  // Always empty — Actions are not part of this increment (moderation.md
-  // §7's future surface). A genuinely correct reflection of current state,
-  // not a placeholder bug.
-  actions: [];
+  actions: ActionResponse[];
 }
 
 // Case creation/assignment/priority/closure (moderation.md §7). Manual
@@ -124,7 +122,13 @@ export class CasesService {
   }
 
   async getCase(caseId: string): Promise<CaseDetailResponse> {
-    const kase = await this.prisma.case.findUnique({ where: { id: caseId }, include: { caseReports: { include: { report: true } } } });
+    const kase = await this.prisma.case.findUnique({
+      where: { id: caseId },
+      include: {
+        caseReports: { include: { report: true } },
+        actions: { include: { sanctions: { select: { id: true } } }, orderBy: [{ createdAt: 'desc' }] },
+      },
+    });
     if (!kase) {
       throw new ResourceNotFoundException();
     }
@@ -232,11 +236,31 @@ export class CasesService {
     };
   }
 
-  private toDetailResponse(kase: Case & { caseReports: (CaseReport & { report: Report })[] }): CaseDetailResponse {
+  private toActionResponse(action: Action & { sanctions: { id: string }[] }): ActionResponse {
+    return {
+      id: action.id,
+      caseId: action.caseId,
+      actorId: action.actorId,
+      targetType: action.targetType,
+      targetId: action.targetId,
+      actionType: action.actionType,
+      scope: action.scope,
+      reasonCode: action.reasonCode,
+      durationSeconds: action.durationSeconds,
+      startsAt: action.startsAt,
+      endsAt: action.endsAt,
+      createdAt: action.createdAt,
+      ...(action.sanctions[0] && { sanctionId: action.sanctions[0].id }),
+    };
+  }
+
+  private toDetailResponse(
+    kase: Case & { caseReports: (CaseReport & { report: Report })[]; actions: (Action & { sanctions: { id: string }[] })[] },
+  ): CaseDetailResponse {
     return {
       ...this.toSummaryResponse(kase, kase.caseReports.length),
       reports: kase.caseReports.map((cr) => this.toReportSummary(cr.report)),
-      actions: [],
+      actions: kase.actions.map((a) => this.toActionResponse(a)),
     };
   }
 }

@@ -6,6 +6,8 @@ import { ReportsController } from './reports.controller';
 import { ReportsService } from './reports.service';
 import { CasesController } from './cases.controller';
 import { CasesService } from './cases.service';
+import { ActionsController } from './actions.controller';
+import { ActionsService } from './actions.service';
 import { AuthModule } from '../auth/auth.module';
 import { ContentModule } from '../content/content.module';
 import { MessagingModule } from '../messaging/messaging.module';
@@ -37,7 +39,7 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
     CommunitiesModule,
     JwtModule.register({ secret: process.env.JWT_ACCESS_SECRET }),
   ],
-  controllers: [AccountAppealsController, ReportsController, CasesController],
-  providers: [AccountAppealsService, ReportsService, CasesService, JwtAuthGuard, PlatformRoleGuard, CsrfGuard],
+  controllers: [AccountAppealsController, ReportsController, CasesController, ActionsController],
+  providers: [AccountAppealsService, ReportsService, CasesService, ActionsService, JwtAuthGuard, PlatformRoleGuard, CsrfGuard],
 })
 export class ModerationModule {}

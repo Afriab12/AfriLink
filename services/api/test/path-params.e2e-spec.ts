@@ -95,6 +95,15 @@ const ROUTES: Route[] = [
   { method: 'POST', path: '/moderation/cases/:caseId/assign', body: {}, unknown: 404 },
   { method: 'PATCH', path: '/moderation/cases/:caseId', body: { priority: 'normal' }, unknown: 404 },
   { method: 'POST', path: '/moderation/cases/:caseId/close', unknown: 404 },
+  // moderation (Actions, Increment B1) — case existence is checked before
+  // any target resolution, so a malformed/nonexistent caseId never touches
+  // the target-lookup tables; no new tripwire allowlist entry needed.
+  {
+    method: 'POST',
+    path: '/moderation/cases/:caseId/actions',
+    body: { actionType: 'warn_user', targetType: 'profile', targetId: randomUUID(), reasonCode: 'spam' },
+    unknown: 404,
+  },
 ];
 
 // The parametrised routes that are NOT pure UUID routes: each accepts a UUID or another identifier
