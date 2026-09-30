@@ -108,6 +108,11 @@ const ROUTES: Route[] = [
   // other table is touched, so a malformed/nonexistent actionId never
   // reaches the target-lookup tables; no new tripwire allowlist entry needed.
   { method: 'POST', path: '/moderation/actions/:actionId/reverse', body: { reasonCode: 'spam' }, unknown: 404 },
+  // moderation (Appeal Decisions, Increment B3) — the appeal is looked up
+  // before any other table is touched, so a malformed/nonexistent
+  // appealId never reaches the target-lookup tables; no new tripwire
+  // allowlist entry needed.
+  { method: 'POST', path: '/moderation/appeals/:appealId/decide', body: { decision: 'upheld' }, unknown: 404 },
 ];
 
 // The parametrised routes that are NOT pure UUID routes: each accepts a UUID or another identifier

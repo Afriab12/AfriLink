@@ -336,7 +336,14 @@ export class ActionsService {
   //  6. Case status is never checked — closure is not a hard lock,
   //     already established for creation, extended here without a fresh
   //     decision.
-  async reverseAction(moderatorId: string, actionId: string, dto: ReverseActionDto): Promise<ActionResponse> {
+  // `tx` is optional so a caller that already has its own transaction open
+  // (Appeal Decision, B3) can fold this entirely into it, rather than
+  // committing as a separate, non-atomic step — the same
+  // `tx ?? own-transaction` branch every other multi-statement moderation
+  // callee already uses (AccountSanctionService.applyAccountSanction is
+  // the closest precedent). Behavior for the standalone `/reverse` route
+  // (no `tx` passed) is byte-for-byte unchanged.
+  async reverseAction(moderatorId: string, actionId: string, dto: ReverseActionDto, tx?: Prisma.TransactionClient): Promise<ActionResponse> {
     const original = await this.prisma.action.findUnique({ where: { id: actionId } });
     if (!original) {
       throw new ResourceNotFoundException();
@@ -350,23 +357,23 @@ export class ActionsService {
 
     await this.assertNotSelfTargeting(moderatorId, original.targetType as TargetType, original.targetId);
 
-    const reversal = await this.prisma.$transaction(async (tx) => {
+    const execute = async (innerTx: Prisma.TransactionClient) => {
       // Serializes concurrent reversal attempts against the SAME original
       // action. No DB uniqueness exists on reversalOfActionId, so this
       // advisory lock is the race-safe backstop in its place.
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`action-reversal:${actionId}`}, 0))`;
+      await innerTx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`action-reversal:${actionId}`}, 0))`;
 
-      const existingReversal = await tx.action.findFirst({ where: { reversalOfActionId: actionId } });
+      const existingReversal = await innerTx.action.findFirst({ where: { reversalOfActionId: actionId } });
       if (existingReversal) {
         throw new ConflictException('CONFLICT', 'This action has already been reversed.');
       }
 
-      const sanction = await tx.sanction.findFirst({ where: { sourceActionId: actionId } });
+      const sanction = await innerTx.sanction.findFirst({ where: { sourceActionId: actionId } });
       if (sanction && sanction.state !== 'active') {
         throw new ConflictException('CONFLICT', 'This sanction is no longer active and cannot be reversed.');
       }
 
-      const created = await tx.action.create({
+      const created = await innerTx.action.create({
         data: {
           caseId: original.caseId,
           actorId: moderatorId,
@@ -380,23 +387,25 @@ export class ActionsService {
       });
 
       if (sanction) {
-        await tx.sanction.update({ where: { id: sanction.id }, data: { state: 'revoked' } });
+        await innerTx.sanction.update({ where: { id: sanction.id }, data: { state: 'revoked' } });
         if (sanction.subjectType === 'user') {
-          await this.accountSanction.liftAccountSanction(sanction.subjectId, tx);
+          await this.accountSanction.liftAccountSanction(sanction.subjectId, innerTx);
         } else {
-          await this.communityModeration.liftMembershipSanction(sanction.subjectId, tx);
+          await this.communityModeration.liftMembershipSanction(sanction.subjectId, innerTx);
         }
       } else if (original.actionType === 'remove_content' || original.actionType === 'restrict_content') {
         if (original.targetType === 'message') {
-          await this.messagingModeration.applyMessageModerationStatus(original.targetId, 'active', tx);
+          await this.messagingModeration.applyMessageModerationStatus(original.targetId, 'active', innerTx);
         } else {
-          await this.contentModeration.applyContentModerationStatus(original.targetType as 'post' | 'comment', original.targetId, 'published', tx);
+          await this.contentModeration.applyContentModerationStatus(original.targetType as 'post' | 'comment', original.targetId, 'published', innerTx);
         }
       }
       // warn_user with no sanction: nothing else to undo.
 
       return created;
-    });
+    };
+
+    const reversal = tx ? await execute(tx) : await this.prisma.$transaction((innerTx) => execute(innerTx));
 
     return this.toResponse(reversal);
   }
