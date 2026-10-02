@@ -17,15 +17,7 @@ import { TokenInvalidException } from '../common/errors/api-exception';
 import { RateLimit } from '../common/guards/rate-limit.decorator';
 import { ParseUuidPipe } from '../common/pipes/parse-uuid.pipe';
 import { sha256 } from './token.util';
-
-function buildContext(req: Request): RequestContext {
-  return {
-    ipHash: req.ip ? sha256(req.ip) : undefined,
-    userAgentHash: req.header('user-agent') ? sha256(req.header('user-agent')!) : undefined,
-    deviceId: req.header('X-Device-Id'),
-    deviceLabel: req.header('X-Device-Label'),
-  };
-}
+import { AuditHashService } from '../audit/audit-hash.service';
 
 type RegisterResult = Awaited<ReturnType<AuthService['register']>>;
 type LoginResult = Awaited<ReturnType<AuthService['login']>>;
@@ -36,7 +28,28 @@ type ListSessionsResult = Awaited<ReturnType<AuthService['listSessions']>>;
 @ApiTags('Auth')
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly auditHash: AuditHashService,
+  ) {}
+
+  // Session-table hashes (ipHash/userAgentHash, plain sha256()) are
+  // completely unchanged. auditIpHash/auditUserAgentHash are a separate,
+  // HMAC-SHA256-keyed computation for Audit C — the two are never the
+  // same value, by construction, never reused across the two purposes.
+  private buildContext(req: Request): RequestContext {
+    const rawIp = req.ip;
+    const rawUserAgent = req.header('user-agent');
+    return {
+      ipHash: rawIp ? sha256(rawIp) : undefined,
+      userAgentHash: rawUserAgent ? sha256(rawUserAgent) : undefined,
+      deviceId: req.header('X-Device-Id'),
+      deviceLabel: req.header('X-Device-Label'),
+      requestId: (req as Request & { requestId?: string }).requestId,
+      auditIpHash: rawIp ? this.auditHash.hash(rawIp) : undefined,
+      auditUserAgentHash: rawUserAgent ? this.auditHash.hash(rawUserAgent) : undefined,
+    };
+  }
 
   @Post('register')
   @RateLimit(5, 3_600_000)
@@ -45,7 +58,7 @@ export class AuthController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ data: Pick<RegisterResult, 'user' | 'verification'> }> {
-    const result = await this.authService.register(dto, buildContext(req));
+    const result = await this.authService.register(dto, this.buildContext(req));
     setAuthCookies(res, result.tokens);
     return { data: { user: result.user, verification: result.verification } };
   }
@@ -58,7 +71,7 @@ export class AuthController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ data: Pick<LoginResult, 'user'> }> {
-    const result = await this.authService.login(dto, buildContext(req));
+    const result = await this.authService.login(dto, this.buildContext(req));
     setAuthCookies(res, result.tokens);
     return { data: { user: result.user } };
   }
@@ -71,7 +84,7 @@ export class AuthController {
     if (!raw) {
       throw new TokenInvalidException('No refresh token presented.');
     }
-    const tokens = await this.authService.refresh(raw, buildContext(req));
+    const tokens = await this.authService.refresh(raw, this.buildContext(req));
     setAuthCookies(res, tokens);
     return { data: { rotated: true } };
   }
@@ -81,10 +94,11 @@ export class AuthController {
   @UseGuards(JwtAuthGuard, CsrfGuard)
   @SkipAccountStatusCheck()
   async logout(
-    @CurrentUser() user: { sid: string },
+    @CurrentUser() user: { sub: string; sid: string },
+    @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ data: { loggedOut: boolean } }> {
-    await this.authService.logout(user.sid);
+    await this.authService.logout(user.sub, user.sid, this.buildContext(req));
     clearAuthCookies(res);
     return { data: { loggedOut: true } };
   }
@@ -95,9 +109,10 @@ export class AuthController {
   @SkipAccountStatusCheck()
   async logoutAll(
     @CurrentUser() user: { sub: string },
+    @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ data: { loggedOut: boolean } }> {
-    await this.authService.logoutAll(user.sub);
+    await this.authService.logoutAll(user.sub, this.buildContext(req));
     clearAuthCookies(res);
     return { data: { loggedOut: true } };
   }
@@ -105,8 +120,12 @@ export class AuthController {
   @Post('verify')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard, CsrfGuard)
-  async verify(@CurrentUser() user: { sub: string }, @Body() dto: VerifyDto): Promise<{ data: { verified: boolean } }> {
-    await this.authService.verify(user.sub, dto);
+  async verify(
+    @CurrentUser() user: { sub: string },
+    @Body() dto: VerifyDto,
+    @Req() req: Request,
+  ): Promise<{ data: { verified: boolean } }> {
+    await this.authService.verify(user.sub, dto, this.buildContext(req));
     return { data: { verified: true } };
   }
 
@@ -124,8 +143,8 @@ export class AuthController {
   @Post('password/forgot')
   @HttpCode(200)
   @RateLimit(3, 3_600_000)
-  async forgotPassword(@Body() dto: ForgotPasswordDto): Promise<{ data: { requested: boolean } & ForgotPasswordResult }> {
-    const result = await this.authService.forgotPassword(dto);
+  async forgotPassword(@Body() dto: ForgotPasswordDto, @Req() req: Request): Promise<{ data: { requested: boolean } & ForgotPasswordResult }> {
+    const result = await this.authService.forgotPassword(dto, this.buildContext(req));
     // `requested: true` is always identical regardless of whether the
     // account exists; devOnly* fields are dev/test-only and only present
     // (never in production) when a matching account was actually found.
@@ -135,8 +154,8 @@ export class AuthController {
   @Post('password/reset')
   @HttpCode(200)
   @RateLimit(5, 3_600_000)
-  async resetPassword(@Body() dto: ResetPasswordDto): Promise<{ data: { reset: boolean } }> {
-    await this.authService.resetPassword(dto);
+  async resetPassword(@Body() dto: ResetPasswordDto, @Req() req: Request): Promise<{ data: { reset: boolean } }> {
+    await this.authService.resetPassword(dto, this.buildContext(req));
     return { data: { reset: true } };
   }
 
@@ -153,8 +172,9 @@ export class AuthController {
   async revokeSession(
     @CurrentUser() user: { sub: string },
     @Param('sessionId', ParseUuidPipe) sessionId: string,
+    @Req() req: Request,
   ): Promise<{ data: { revoked: boolean } }> {
-    await this.authService.revokeSession(user.sub, sessionId);
+    await this.authService.revokeSession(user.sub, sessionId, this.buildContext(req));
     return { data: { revoked: true } };
   }
 }

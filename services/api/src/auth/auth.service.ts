@@ -3,6 +3,8 @@ import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { AuditService } from '../audit/audit.service';
+import type { AuditEventInput } from '../audit/dto/audit-event.types';
 import {
   AccountRestrictedException,
   ConflictException,
@@ -21,10 +23,18 @@ import type { ForgotPasswordDto } from './dto/forgot-password.dto';
 import type { ResetPasswordDto } from './dto/reset-password.dto';
 
 export interface RequestContext {
+  // Session-table hashes (unchanged, plain sha256() — never touched by
+  // Audit C; a distinct mechanism from the fields below).
   ipHash?: string;
   userAgentHash?: string;
   deviceId?: string;
   deviceLabel?: string;
+  // Audit C additions — computed in AuthController.buildContext() via
+  // AuditHashService (HMAC-SHA256 + AUDIT_HASH_SECRET), forwarded here
+  // verbatim. AuthService never hashes anything itself.
+  requestId?: string;
+  auditIpHash?: string;
+  auditUserAgentHash?: string;
 }
 
 export interface IssuedTokens {
@@ -42,7 +52,20 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
+    private readonly audit: AuditService,
   ) {}
+
+  // Best-effort events must never fail the authentication operation they
+  // accompany (Audit C, decision #10). The log line names only the event
+  // type — never AUDIT_HASH_SECRET, raw IP/UA, a password, a code, or any
+  // token/credential, since none of those are ever interpolated here.
+  private async recordBestEffortAudit(input: AuditEventInput): Promise<void> {
+    try {
+      await this.audit.record(input);
+    } catch {
+      console.warn(`[audit] best-effort event "${input.eventType}" failed to record`);
+    }
+  }
 
   private resolveIdentifier(input: { email?: string; phone?: string }): {
     kind: 'email' | 'phone';
@@ -166,6 +189,19 @@ export class AuthService {
     });
 
     const tokens = await this.issueSession(credential.userId, context);
+
+    await this.recordBestEffortAudit({
+      eventType: 'auth_login_succeeded',
+      actorId: credential.userId,
+      subjectType: 'profile',
+      subjectId: credential.userId,
+      requestId: context.requestId,
+      ipHash: context.auditIpHash,
+      userAgentHash: context.auditUserAgentHash,
+      metadata: { sessionId: tokens.sessionId },
+      occurredAt: new Date(),
+    });
+
     return { user: { id: credential.user.id, status: credential.user.status }, tokens };
   }
 
@@ -184,6 +220,19 @@ export class AuthService {
         where: { userId: session.userId, revokedAt: null },
         data: { revokedAt: new Date(), revokeReason: 'reuse_detected' },
       });
+      // actorId null — system-detected, not a user-initiated action.
+      await this.recordBestEffortAudit({
+        eventType: 'auth_all_sessions_revoked',
+        actorId: null,
+        subjectType: 'profile',
+        subjectId: session.userId,
+        requestId: context.requestId,
+        ipHash: context.auditIpHash,
+        userAgentHash: context.auditUserAgentHash,
+        reason: 'reuse_detected',
+        metadata: {},
+        occurredAt: new Date(),
+      });
       throw new TokenInvalidException('This session has been revoked.');
     }
 
@@ -200,17 +249,45 @@ export class AuthService {
     });
   }
 
-  async logout(sessionId: string): Promise<void> {
-    await this.prisma.session.updateMany({
+  async logout(userId: string, sessionId: string, context: RequestContext): Promise<void> {
+    const result = await this.prisma.session.updateMany({
       where: { id: sessionId, revokedAt: null },
       data: { revokedAt: new Date(), revokeReason: 'logout' },
     });
+    // Only audit a revocation that actually happened — preserves the
+    // existing no-op-is-still-200 behavior above unchanged.
+    if (result.count > 0) {
+      await this.recordBestEffortAudit({
+        eventType: 'auth_session_revoked',
+        actorId: userId,
+        subjectType: 'profile',
+        subjectId: userId,
+        requestId: context.requestId,
+        ipHash: context.auditIpHash,
+        userAgentHash: context.auditUserAgentHash,
+        reason: 'logout',
+        metadata: { sessionId },
+        occurredAt: new Date(),
+      });
+    }
   }
 
-  async logoutAll(userId: string): Promise<void> {
+  async logoutAll(userId: string, context: RequestContext): Promise<void> {
     await this.prisma.session.updateMany({
       where: { userId, revokedAt: null },
       data: { revokedAt: new Date(), revokeReason: 'logout_all' },
+    });
+    await this.recordBestEffortAudit({
+      eventType: 'auth_all_sessions_revoked',
+      actorId: userId,
+      subjectType: 'profile',
+      subjectId: userId,
+      requestId: context.requestId,
+      ipHash: context.auditIpHash,
+      userAgentHash: context.auditUserAgentHash,
+      reason: 'logout_all',
+      metadata: {},
+      occurredAt: new Date(),
     });
   }
 
@@ -230,7 +307,7 @@ export class AuthService {
     return sessions;
   }
 
-  async revokeSession(userId: string, sessionId: string): Promise<void> {
+  async revokeSession(userId: string, sessionId: string, context: RequestContext): Promise<void> {
     const session = await this.prisma.session.findUnique({ where: { id: sessionId } });
     if (!session || session.userId !== userId) {
       throw new ResourceNotFoundException();
@@ -238,6 +315,18 @@ export class AuthService {
     await this.prisma.session.update({
       where: { id: sessionId },
       data: { revokedAt: new Date(), revokeReason: 'user_revoked' },
+    });
+    await this.recordBestEffortAudit({
+      eventType: 'auth_session_revoked',
+      actorId: userId,
+      subjectType: 'profile',
+      subjectId: userId,
+      requestId: context.requestId,
+      ipHash: context.auditIpHash,
+      userAgentHash: context.auditUserAgentHash,
+      reason: 'user_revoked',
+      metadata: { sessionId },
+      occurredAt: new Date(),
     });
   }
 
@@ -271,7 +360,7 @@ export class AuthService {
     };
   }
 
-  async verify(userId: string, dto: VerifyDto): Promise<void> {
+  async verify(userId: string, dto: VerifyDto, context: RequestContext): Promise<void> {
     const challenge = await this.prisma.verificationChallenge.findUnique({ where: { id: dto.challengeId } });
 
     if (!challenge || challenge.userId !== userId || challenge.purpose !== 'account_verification') {
@@ -295,19 +384,38 @@ export class AuthService {
       throw new TokenInvalidException('Invalid verification code.');
     }
 
-    await this.prisma.$transaction([
-      this.prisma.verificationChallenge.update({
+    // Callback form (converted from array form) so the mandatory
+    // auth_account_verified write can share this same transaction's `tx`
+    // client — array-form $transaction cannot host an interactive,
+    // tx-consuming call (Audit C, decision #9/#18).
+    const occurredAt = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.verificationChallenge.update({
         where: { id: challenge.id },
-        data: { consumedAt: new Date() },
-      }),
-      this.prisma.credential.updateMany({
+        data: { consumedAt: occurredAt },
+      });
+      await tx.credential.updateMany({
         where: { userId, kind: challenge.channel, revokedAt: null },
-        data: { verifiedAt: new Date() },
-      }),
-    ]);
+        data: { verifiedAt: occurredAt },
+      });
+      await this.audit.record(
+        {
+          eventType: 'auth_account_verified',
+          actorId: userId,
+          subjectType: 'profile',
+          subjectId: userId,
+          requestId: context.requestId,
+          ipHash: context.auditIpHash,
+          userAgentHash: context.auditUserAgentHash,
+          metadata: { channel: challenge.channel as 'email' | 'phone' },
+          occurredAt,
+        },
+        tx,
+      );
+    });
   }
 
-  async forgotPassword(dto: ForgotPasswordDto): Promise<{ devOnlyCode?: string; devOnlyChallengeId?: string }> {
+  async forgotPassword(dto: ForgotPasswordDto, context: RequestContext): Promise<{ devOnlyCode?: string; devOnlyChallengeId?: string }> {
     const { kind, normalized } = this.resolveIdentifier(dto);
     const credential = await this.prisma.credential.findFirst({
       where: { kind, identifierNormalized: normalized, revokedAt: null },
@@ -334,13 +442,30 @@ export class AuthService {
       },
     });
 
+    // Best-effort, and only on this resolved-account branch — never on the
+    // `if (!credential) return {}` path above. The event's own absence is
+    // part of the enumeration defense (Audit C, decision #6/#16), not an
+    // oversight: an existence-conditional audit row would itself be an
+    // oracle the identical HTTP response is designed to prevent.
+    await this.recordBestEffortAudit({
+      eventType: 'auth_password_reset_requested',
+      actorId: null,
+      subjectType: 'profile',
+      subjectId: credential.userId,
+      requestId: context.requestId,
+      ipHash: context.auditIpHash,
+      userAgentHash: context.auditUserAgentHash,
+      metadata: { challengeId: challenge.id },
+      occurredAt: new Date(),
+    });
+
     if (process.env.NODE_ENV !== 'production') {
       return { devOnlyCode: code, devOnlyChallengeId: challenge.id };
     }
     return {};
   }
 
-  async resetPassword(dto: ResetPasswordDto): Promise<void> {
+  async resetPassword(dto: ResetPasswordDto, context: RequestContext): Promise<void> {
     const challenge = await this.prisma.verificationChallenge.findUnique({ where: { id: dto.challengeId } });
 
     if (!challenge || challenge.purpose !== 'password_reset') {
@@ -362,21 +487,56 @@ export class AuthService {
 
     const passwordHash = await argon2.hash(dto.newPassword, { type: argon2.argon2id });
 
-    await this.prisma.$transaction([
-      this.prisma.verificationChallenge.update({
+    // Callback form (converted from array form) so both mandatory audit
+    // writes below can share this transaction's `tx` client (Audit C,
+    // decision #9/#18). occurredAt captured once and reused for the DB
+    // writes and both audit events (decision #11).
+    const occurredAt = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.verificationChallenge.update({
         where: { id: challenge.id },
-        data: { consumedAt: new Date() },
-      }),
-      this.prisma.credential.updateMany({
+        data: { consumedAt: occurredAt },
+      });
+      await tx.credential.updateMany({
         where: { userId: challenge.userId, kind: challenge.channel, revokedAt: null },
         data: { secretHash: passwordHash },
-      }),
+      });
       // Security-sensitive credential change — revoke every existing
       // session (architecture.md §10 / ADR-004 §1).
-      this.prisma.session.updateMany({
+      await tx.session.updateMany({
         where: { userId: challenge.userId, revokedAt: null },
-        data: { revokedAt: new Date(), revokeReason: 'password_reset' },
-      }),
-    ]);
+        data: { revokedAt: occurredAt, revokeReason: 'password_reset' },
+      });
+
+      await this.audit.record(
+        {
+          eventType: 'auth_password_reset_completed',
+          actorId: null,
+          subjectType: 'profile',
+          subjectId: challenge.userId,
+          requestId: context.requestId,
+          ipHash: context.auditIpHash,
+          userAgentHash: context.auditUserAgentHash,
+          metadata: { challengeId: challenge.id },
+          occurredAt,
+        },
+        tx,
+      );
+      await this.audit.record(
+        {
+          eventType: 'auth_all_sessions_revoked',
+          actorId: null,
+          subjectType: 'profile',
+          subjectId: challenge.userId,
+          requestId: context.requestId,
+          ipHash: context.auditIpHash,
+          userAgentHash: context.auditUserAgentHash,
+          reason: 'password_reset',
+          metadata: {},
+          occurredAt,
+        },
+        tx,
+      );
+    });
   }
 }

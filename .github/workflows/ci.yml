@@ -56,6 +56,10 @@ jobs:
       DATABASE_URL: postgresql://afrilink:afrilink_ci_only@localhost:5432/afrilink_test
       # CI-only, throwaway — never used outside this ephemeral job.
       JWT_ACCESS_SECRET: ci-test-secret-not-for-production-use
+      # CI-only, throwaway, distinct from JWT_ACCESS_SECRET above — AuditHashService
+      # (Audit C) requires this via requireEnv() the same way MediaStorageService
+      # requires the MEDIA_S3_* block below.
+      AUDIT_HASH_SECRET: ci-test-audit-secret-not-for-production-use
       NODE_ENV: test
       # CI-only placeholders, not secrets, no production credential. No
       # object store runs in CI: MediaStorageService's constructor only

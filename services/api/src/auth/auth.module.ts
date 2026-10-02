@@ -3,6 +3,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { AccountSanctionService } from './account-sanction.service';
+import { AuditModule } from '../audit/audit.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 
@@ -11,6 +12,7 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
     JwtModule.register({
       secret: process.env.JWT_ACCESS_SECRET,
     }),
+    AuditModule,
   ],
   controllers: [AuthController],
   providers: [AuthService, AccountSanctionService, JwtAuthGuard, CsrfGuard],

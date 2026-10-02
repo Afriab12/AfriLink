@@ -8,6 +8,7 @@ import { JwtService } from '@nestjs/jwt';
 import { AppModule } from '../src/app.module';
 import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { AuditService } from '../src/audit/audit.service';
 
 // Extracts a Cookie header string from a supertest response's Set-Cookie
 // headers, so subsequent requests in the same test can present them —
@@ -477,6 +478,314 @@ describe('Authentication (e2e)', () => {
   // NODE_ENV=test (see rate-limit.decorator.ts) precisely so the many
   // legitimate register/login calls throughout this suite don't cascade
   // into 429s against each other.
+
+  // -------------------------------------------------------- audit (Audit C)
+
+  describe('Audit integration (Audit C)', () => {
+    async function latestAuditEvent(eventType: string, subjectId: string) {
+      return prisma.auditEvent.findFirst({ where: { eventType: eventType as never, subjectId }, orderBy: { createdAt: 'desc' } });
+    }
+
+    async function registerAndCapture(): Promise<{ email: string; password: string; userId: string; cookies: Record<string, string> }> {
+      const email = uniqueEmail();
+      const password = 'correct-horse-battery-staple';
+      const res = await request(app.getHttpServer()).post('/api/v1/auth/register').send({ email, password }).expect(201);
+      return { email, password, userId: res.body.data.user.id as string, cookies: extractCookies(res) };
+    }
+
+    describe('auth_login_succeeded', () => {
+      it('records actor/subject/requestId/hashed IP+UA/metadata on successful login', async () => {
+        const { email, password, userId } = await registerAndCapture();
+
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/login')
+          .set('User-Agent', 'audit-c-test-agent/1.0')
+          .send({ email, password })
+          .expect(200);
+
+        const event = await latestAuditEvent('auth_login_succeeded', userId);
+        expect(event?.actorId).toBe(userId);
+        expect(event?.subjectType).toBe('profile');
+        expect(event?.requestId).toBeDefined();
+        expect(event?.ipHash).toBeDefined();
+        expect(event?.userAgentHash).toBeDefined();
+        expect(event?.metadata).toHaveProperty('sessionId');
+      });
+
+      it('is best-effort: login still succeeds and sets cookies even if the audit write fails', async () => {
+        const auditService = app.get(AuditService);
+        const { email, password } = await registerAndCapture();
+
+        const spy = vi.spyOn(auditService, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        const res = await request(app.getHttpServer()).post('/api/v1/auth/login').send({ email, password }).expect(200);
+        spy.mockRestore();
+
+        expect(extractCookies(res)['afrilink_at']).toBeDefined();
+      });
+
+      it('register() itself does not emit auth_login_succeeded (that event is login-only)', async () => {
+        const { userId } = await registerAndCapture();
+        const event = await latestAuditEvent('auth_login_succeeded', userId);
+        expect(event).toBeNull();
+      });
+    });
+
+    describe('auth_account_verified', () => {
+      it('records the event atomically with verification, metadata = { channel }', async () => {
+        const email = uniqueEmail();
+        const registerRes = await request(app.getHttpServer())
+          .post('/api/v1/auth/register')
+          .send({ email, password: 'correct-horse-battery-staple' })
+          .expect(201);
+        const userId = registerRes.body.data.user.id as string;
+        const cookies = extractCookies(registerRes);
+        const { challengeId, devOnlyCode } = registerRes.body.data.verification;
+
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/verify')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+          .set('X-CSRF-Token', cookies['afrilink_csrf'])
+          .send({ challengeId, code: devOnlyCode })
+          .expect(200);
+
+        const event = await latestAuditEvent('auth_account_verified', userId);
+        expect(event?.actorId).toBe(userId);
+        expect(event?.metadata).toEqual({ channel: 'email' });
+      });
+
+      it('atomicity: a forced audit failure rolls back verification (credential stays unverified)', async () => {
+        const auditService = app.get(AuditService);
+        const email = uniqueEmail();
+        const registerRes = await request(app.getHttpServer())
+          .post('/api/v1/auth/register')
+          .send({ email, password: 'correct-horse-battery-staple' })
+          .expect(201);
+        const userId = registerRes.body.data.user.id as string;
+        const cookies = extractCookies(registerRes);
+        const { challengeId, devOnlyCode } = registerRes.body.data.verification;
+
+        const spy = vi.spyOn(auditService, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/verify')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+          .set('X-CSRF-Token', cookies['afrilink_csrf'])
+          .send({ challengeId, code: devOnlyCode })
+          .expect(500);
+        spy.mockRestore();
+
+        const credential = await prisma.credential.findFirst({ where: { userId } });
+        expect(credential?.verifiedAt).toBeNull();
+        const challenge = await prisma.verificationChallenge.findUniqueOrThrow({ where: { id: challengeId } });
+        expect(challenge.consumedAt).toBeNull();
+      });
+    });
+
+    describe('auth_password_reset_requested', () => {
+      it('records the event only when a real account resolves, metadata = { challengeId }', async () => {
+        const { email, userId } = await registerAndCapture();
+
+        const forgotRes = await request(app.getHttpServer()).post('/api/v1/auth/password/forgot').send({ email }).expect(200);
+        const { devOnlyChallengeId } = forgotRes.body.data;
+
+        const event = await latestAuditEvent('auth_password_reset_requested', userId);
+        expect(event?.actorId).toBeNull();
+        expect(event?.metadata).toEqual({ challengeId: devOnlyChallengeId });
+      });
+
+      it('enumeration safety: emits no event for a non-existent account', async () => {
+        const before = await prisma.auditEvent.count({ where: { eventType: 'auth_password_reset_requested' } });
+        await request(app.getHttpServer()).post('/api/v1/auth/password/forgot').send({ email: uniqueEmail() }).expect(200);
+        const after = await prisma.auditEvent.count({ where: { eventType: 'auth_password_reset_requested' } });
+        expect(after).toBe(before);
+      });
+    });
+
+    describe('auth_password_reset_completed + auth_all_sessions_revoked(password_reset)', () => {
+      it('records both events atomically, inside the same reset', async () => {
+        const { email, userId } = await registerAndCapture();
+        const forgotRes = await request(app.getHttpServer()).post('/api/v1/auth/password/forgot').send({ email }).expect(200);
+        const { devOnlyChallengeId, devOnlyCode } = forgotRes.body.data;
+
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/password/reset')
+          .send({ challengeId: devOnlyChallengeId, code: devOnlyCode, newPassword: 'brand-new-password-123' })
+          .expect(200);
+
+        const completed = await latestAuditEvent('auth_password_reset_completed', userId);
+        expect(completed?.actorId).toBeNull();
+        expect(completed?.metadata).toEqual({ challengeId: devOnlyChallengeId });
+
+        const revoked = await latestAuditEvent('auth_all_sessions_revoked', userId);
+        expect(revoked?.reason).toBe('password_reset');
+      });
+
+      it('atomicity: a forced audit failure rolls back the whole reset (old password still works, old session survives)', async () => {
+        const auditService = app.get(AuditService);
+        const { email, password: oldPassword, cookies: originalCookies } = await registerAndCapture();
+        const forgotRes = await request(app.getHttpServer()).post('/api/v1/auth/password/forgot').send({ email }).expect(200);
+        const { devOnlyChallengeId, devOnlyCode } = forgotRes.body.data;
+
+        const spy = vi.spyOn(auditService, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/password/reset')
+          .send({ challengeId: devOnlyChallengeId, code: devOnlyCode, newPassword: 'brand-new-password-123' })
+          .expect(500);
+        spy.mockRestore();
+
+        await request(app.getHttpServer()).post('/api/v1/auth/login').send({ email, password: oldPassword }).expect(200);
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/refresh')
+          .set('Cookie', cookieHeader(originalCookies, 'afrilink_rt'))
+          .expect(200);
+      });
+    });
+
+    describe('auth_session_revoked', () => {
+      it('records reason=logout on logout', async () => {
+        const { userId, cookies } = await registerAndCapture();
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/logout')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+          .set('X-CSRF-Token', cookies['afrilink_csrf'])
+          .expect(200);
+
+        const event = await latestAuditEvent('auth_session_revoked', userId);
+        expect(event?.actorId).toBe(userId);
+        expect(event?.reason).toBe('logout');
+      });
+
+      it('records reason=user_revoked on explicit session revocation', async () => {
+        const { userId, cookies } = await registerAndCapture();
+        const sessionsRes = await request(app.getHttpServer())
+          .get('/api/v1/auth/sessions')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at'))
+          .expect(200);
+        const sessionId = sessionsRes.body.data[0].id as string;
+
+        await request(app.getHttpServer())
+          .delete(`/api/v1/auth/sessions/${sessionId}`)
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+          .set('X-CSRF-Token', cookies['afrilink_csrf'])
+          .expect(200);
+
+        const event = await latestAuditEvent('auth_session_revoked', userId);
+        expect(event?.reason).toBe('user_revoked');
+        expect(event?.metadata).toEqual({ sessionId });
+      });
+
+      it('does NOT record anything for routine refresh-token rotation', async () => {
+        const { userId, cookies } = await registerAndCapture();
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/refresh')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_rt'))
+          .expect(200);
+
+        const count = await prisma.auditEvent.count({ where: { eventType: 'auth_session_revoked', subjectId: userId } });
+        expect(count).toBe(0);
+      });
+
+      it('is best-effort: logout still succeeds even if the audit write fails', async () => {
+        const auditService = app.get(AuditService);
+        const { cookies } = await registerAndCapture();
+
+        const spy = vi.spyOn(auditService, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/logout')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+          .set('X-CSRF-Token', cookies['afrilink_csrf'])
+          .expect(200);
+        spy.mockRestore();
+      });
+    });
+
+    describe('auth_all_sessions_revoked', () => {
+      it('records reason=logout_all on logout-all', async () => {
+        const { userId, cookies } = await registerAndCapture();
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/logout-all')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_at', 'afrilink_csrf'))
+          .set('X-CSRF-Token', cookies['afrilink_csrf'])
+          .expect(200);
+
+        const event = await latestAuditEvent('auth_all_sessions_revoked', userId);
+        expect(event?.actorId).toBe(userId);
+        expect(event?.reason).toBe('logout_all');
+      });
+
+      it('records reason=reuse_detected on refresh-token theft detection, actorId null', async () => {
+        const { userId, cookies } = await registerAndCapture();
+        const rotatedRes = await request(app.getHttpServer())
+          .post('/api/v1/auth/refresh')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_rt'))
+          .expect(200);
+        void rotatedRes;
+
+        // Reuse of the original (now-revoked) token triggers theft detection.
+        await request(app.getHttpServer())
+          .post('/api/v1/auth/refresh')
+          .set('Cookie', cookieHeader(cookies, 'afrilink_rt'))
+          .expect(401);
+
+        const event = await latestAuditEvent('auth_all_sessions_revoked', userId);
+        expect(event?.actorId).toBeNull();
+        expect(event?.reason).toBe('reuse_detected');
+      });
+    });
+
+    describe('security regression', () => {
+      it('never stores the raw user-agent string, only its hash', async () => {
+        const { email, password, userId } = await registerAndCapture();
+        const rawUserAgent = 'audit-c-raw-ua-marker/9.9';
+
+        await request(app.getHttpServer()).post('/api/v1/auth/login').set('User-Agent', rawUserAgent).send({ email, password }).expect(200);
+
+        const event = await latestAuditEvent('auth_login_succeeded', userId);
+        expect(event?.userAgentHash).not.toBe(rawUserAgent);
+        expect(event?.userAgentHash).not.toContain(rawUserAgent);
+      });
+
+      it("audit ipHash/userAgentHash differ from the Session row's own ipHash/userAgentHash for the same request", async () => {
+        const { email, password, userId } = await registerAndCapture();
+        await request(app.getHttpServer()).post('/api/v1/auth/login').send({ email, password }).expect(200);
+
+        const session = await prisma.session.findFirst({ where: { userId }, orderBy: { createdAt: 'desc' } });
+        const event = await latestAuditEvent('auth_login_succeeded', userId);
+
+        expect(event?.ipHash).toBeDefined();
+        expect(session?.ipHash).toBeDefined();
+        expect(event?.ipHash).not.toBe(session?.ipHash);
+      });
+
+      it('never logs AUDIT_HASH_SECRET or any sensitive value when a best-effort audit write fails', async () => {
+        const auditService = app.get(AuditService);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const { email, password } = await registerAndCapture();
+
+        const spy = vi.spyOn(auditService, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        await request(app.getHttpServer()).post('/api/v1/auth/login').send({ email, password }).expect(200);
+        spy.mockRestore();
+
+        const logged = warnSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+        warnSpy.mockRestore();
+
+        expect(logged).toContain('auth_login_succeeded');
+        expect(logged).not.toContain(process.env.AUDIT_HASH_SECRET);
+        expect(logged.toLowerCase()).not.toMatch(/password|secret|token|credential/);
+      });
+
+      it('metadata never carries a password, code, or token field for any auth audit event recorded this run', async () => {
+        const events = await prisma.auditEvent.findMany({
+          where: { eventType: { in: ['auth_login_succeeded', 'auth_account_verified', 'auth_password_reset_requested', 'auth_password_reset_completed'] } },
+        });
+        for (const event of events) {
+          const keys = Object.keys(event.metadata as object);
+          for (const key of keys) {
+            expect(key.toLowerCase()).not.toMatch(/password|code|token|credential|secret/);
+          }
+        }
+      });
+    });
+  });
 
   it('cleans up test data it created', async () => {
     // Sanity check that this suite is actually hitting the isolated test

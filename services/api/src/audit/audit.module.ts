@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
 import { AuditService } from './audit.service';
+import { AuditHashService } from './audit-hash.service';
 
-// Not registered in app.module.ts yet — Audit A (the writer) only.
-// Auth/Moderation producer wiring is a separate, later-approved increment.
+// Imported by ModerationModule (Audit B) and AuthModule (Audit C).
 @Module({
-  providers: [AuditService],
-  exports: [AuditService],
+  providers: [AuditService, AuditHashService],
+  exports: [AuditService, AuditHashService],
 })
 export class AuditModule {}
