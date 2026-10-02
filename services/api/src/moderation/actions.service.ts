@@ -6,6 +6,7 @@ import { ContentModerationService } from '../content/content-moderation.service'
 import { MessagingModerationService } from '../messaging/messaging-moderation.service';
 import { CommunityModerationService } from '../communities/community-moderation.service';
 import { AccountSanctionService } from '../auth/account-sanction.service';
+import { AuditService } from '../audit/audit.service';
 import { ConflictException, ForbiddenActionException, PolicyRejectedException, ResourceNotFoundException, ValidationFailedException } from '../common/errors/api-exception';
 import type { CreateActionDto } from './dto/create-action.dto';
 import type { ReverseActionDto } from './dto/reverse-action.dto';
@@ -63,6 +64,7 @@ export class ActionsService {
     private readonly messagingModeration: MessagingModerationService,
     private readonly communityModeration: CommunityModerationService,
     private readonly accountSanction: AccountSanctionService,
+    private readonly audit: AuditService,
   ) {}
 
   async createAction(moderatorId: string, caseId: string, dto: CreateActionDto): Promise<ActionResponse> {
@@ -129,6 +131,18 @@ export class ActionsService {
       } else {
         await this.contentModeration.applyContentModerationStatus(dto.targetType as 'post' | 'comment', dto.targetId, status, tx);
       }
+      await this.audit.record(
+        {
+          eventType: 'moderation_action_recorded',
+          actorId: moderatorId,
+          subjectType: dto.targetType,
+          subjectId: dto.targetId,
+          reason: dto.reasonCode,
+          metadata: { actionType: dto.actionType, targetType: dto.targetType, targetId: dto.targetId },
+          occurredAt: created.createdAt,
+        },
+        tx,
+      );
       return created;
     });
     return this.toResponse(action);
@@ -149,16 +163,34 @@ export class ActionsService {
       throw new ResourceNotFoundException();
     }
 
-    const action = await this.prisma.action.create({
-      data: {
-        caseId,
-        actorId: moderatorId,
-        targetType: 'profile',
-        targetId: dto.targetId,
-        actionType: 'warn_user',
-        scope: queue,
-        reasonCode: dto.reasonCode,
-      },
+    // Wrapped in its own $transaction (previously a single statement) so
+    // the mandatory moderation_action_recorded write is atomic with the
+    // Action insert — approved judgment call #1, Audit B design review.
+    const action = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.action.create({
+        data: {
+          caseId,
+          actorId: moderatorId,
+          targetType: 'profile',
+          targetId: dto.targetId,
+          actionType: 'warn_user',
+          scope: queue,
+          reasonCode: dto.reasonCode,
+        },
+      });
+      await this.audit.record(
+        {
+          eventType: 'moderation_action_recorded',
+          actorId: moderatorId,
+          subjectType: 'profile',
+          subjectId: dto.targetId,
+          reason: dto.reasonCode,
+          metadata: { actionType: 'warn_user', targetType: 'profile', targetId: dto.targetId },
+          occurredAt: created.createdAt,
+        },
+        tx,
+      );
+      return created;
     });
     return this.toResponse(action);
   }
@@ -231,6 +263,25 @@ export class ActionsService {
 
         await this.accountSanction.applyAccountSanction(dto.targetId, status, sanction.id, tx);
 
+        await this.audit.record(
+          {
+            eventType: 'moderation_action_recorded',
+            actorId: moderatorId,
+            subjectType: 'profile',
+            subjectId: dto.targetId,
+            reason: dto.reasonCode,
+            metadata: {
+              actionType: status === 'suspended' ? 'suspend_account' : 'ban_account',
+              targetType: 'profile',
+              targetId: dto.targetId,
+              sanctionId: sanction.id,
+              ...(dto.details?.durationSeconds !== undefined ? { durationSeconds: dto.details.durationSeconds } : {}),
+            },
+            occurredAt: created.createdAt,
+          },
+          tx,
+        );
+
         return { action: created, sanctionId: sanction.id };
       });
       return this.toResponse(result.action, result.sanctionId);
@@ -291,6 +342,26 @@ export class ActionsService {
 
         // Always 'banned', never 'removed' — K.1, unchanged.
         await this.communityModeration.applyMembershipSanction(membership.id, 'banned', tx);
+
+        await this.audit.record(
+          {
+            eventType: 'moderation_action_recorded',
+            actorId: moderatorId,
+            subjectType: 'profile',
+            subjectId: dto.targetId,
+            reason: dto.reasonCode,
+            metadata: {
+              actionType: 'restrict_community_participation',
+              targetType: 'profile',
+              targetId: dto.targetId,
+              sanctionId: sanction.id,
+              communityId,
+              ...(dto.details?.durationSeconds !== undefined ? { durationSeconds: dto.details.durationSeconds } : {}),
+            },
+            occurredAt: created.createdAt,
+          },
+          tx,
+        );
 
         return { action: created, sanctionId: sanction.id };
       });
@@ -401,6 +472,19 @@ export class ActionsService {
         }
       }
       // warn_user with no sanction: nothing else to undo.
+
+      await this.audit.record(
+        {
+          eventType: 'moderation_action_reversed',
+          actorId: moderatorId,
+          subjectType: original.targetType,
+          subjectId: original.targetId,
+          reason: dto.reasonCode,
+          metadata: { actionType: original.actionType, originalActionId: original.id },
+          occurredAt: created.createdAt,
+        },
+        innerTx,
+      );
 
       return created;
     };

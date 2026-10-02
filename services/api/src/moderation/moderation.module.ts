@@ -14,6 +14,7 @@ import { AuthModule } from '../auth/auth.module';
 import { ContentModule } from '../content/content.module';
 import { MessagingModule } from '../messaging/messaging.module';
 import { CommunitiesModule } from '../communities/communities.module';
+import { AuditModule } from '../audit/audit.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { PlatformRoleGuard } from '../common/guards/platform-role.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
@@ -26,9 +27,10 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
 // validation (moderation.md §2's "real target + reporter may not currently
 // see it -> allowed; nonexistent target -> reject" rule). Each is the same
 // cross-module contract surface those modules already export for exactly
-// this purpose. Actions/Sanctions/Appeals-lifecycle (beyond the existing
-// account-appeal credential flow) and moderator queues for those are not
-// built here — Reports + Cases only.
+// this purpose.
+// AuditModule is imported for AuditService — ActionsService/AppealsService
+// are its producers (Audit B); this is the first module anywhere that
+// imports AuditModule.
 // JwtAuthGuard/PlatformRoleGuard/CsrfGuard are redeclared as local
 // providers, same convention Content/Messaging/Communities already use for
 // these guards (they are not exported through a shared module) — Reports/
@@ -39,6 +41,7 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
     ContentModule,
     MessagingModule,
     CommunitiesModule,
+    AuditModule,
     JwtModule.register({ secret: process.env.JWT_ACCESS_SECRET }),
   ],
   controllers: [AccountAppealsController, ReportsController, CasesController, ActionsController, AppealsController],

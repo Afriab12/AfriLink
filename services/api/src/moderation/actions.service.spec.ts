@@ -5,22 +5,28 @@ import { ContentModerationService } from '../content/content-moderation.service'
 import { MessagingModerationService } from '../messaging/messaging-moderation.service';
 import { CommunityModerationService } from '../communities/community-moderation.service';
 import { AccountSanctionService } from '../auth/account-sanction.service';
+import { AuditService } from '../audit/audit.service';
 import { ActionsService } from './actions.service';
 import { ConflictException, ForbiddenActionException, PolicyRejectedException, ResourceNotFoundException, ValidationFailedException } from '../common/errors/api-exception';
 
 describe('ActionsService', () => {
   let prisma: PrismaService;
+  let audit: AuditService;
+  let accountSanction: AccountSanctionService;
   let service: ActionsService;
 
   beforeAll(async () => {
     prisma = new PrismaService();
     await prisma.onModuleInit();
+    audit = new AuditService(prisma);
+    accountSanction = new AccountSanctionService(prisma);
     service = new ActionsService(
       prisma,
       new ContentModerationService(prisma),
       new MessagingModerationService(prisma),
       new CommunityModerationService(prisma),
-      new AccountSanctionService(prisma),
+      accountSanction,
+      audit,
     );
   });
 
@@ -1048,6 +1054,191 @@ describe('ActionsService', () => {
         await prisma.case.update({ where: { id: kase.id }, data: { status: 'closed', closedAt: new Date() } });
 
         await expect(service.reverseAction(reverser.id, original.id, { reasonCode: 'other' })).resolves.toBeDefined();
+      });
+    });
+  });
+
+  // -------------------------------------------------------- audit (Audit B)
+
+  describe('audit integration', () => {
+    async function latestAuditEvent(eventType: string, subjectId: string) {
+      return prisma.auditEvent.findFirst({ where: { eventType: eventType as never, subjectId }, orderBy: { createdAt: 'desc' } });
+    }
+
+    describe('moderation_action_recorded', () => {
+      it('content action: records actor/subject/reason/metadata, occurredAt matching the Action row', async () => {
+        const moderator = await makeUser();
+        const author = await makeUser();
+        const post = await makePost(author.id);
+        const kase = await makeCase('content');
+
+        const action = await service.createAction(moderator.id, kase.id, { actionType: 'remove_content', targetType: 'post', targetId: post.id, reasonCode: 'spam' });
+        const event = await latestAuditEvent('moderation_action_recorded', post.id);
+
+        expect(event?.actorId).toBe(moderator.id);
+        expect(event?.subjectType).toBe('post');
+        expect(event?.subjectId).toBe(post.id);
+        expect(event?.reason).toBe('spam');
+        expect(event?.metadata).toEqual({ actionType: 'remove_content', targetType: 'post', targetId: post.id });
+        expect(event?.occurredAt.getTime()).toBe(action.createdAt.getTime());
+      });
+
+      it('warn_user: records an audit event (the one branch with no pre-existing transaction)', async () => {
+        const moderator = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase();
+
+        const action = await service.createAction(moderator.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        const event = await latestAuditEvent('moderation_action_recorded', target.id);
+
+        expect(event?.actorId).toBe(moderator.id);
+        expect(event?.subjectType).toBe('profile');
+        expect(event?.metadata).toEqual({ actionType: 'warn_user', targetType: 'profile', targetId: target.id });
+        expect(event?.occurredAt.getTime()).toBe(action.createdAt.getTime());
+      });
+
+      it('account sanction: metadata carries the created sanctionId', async () => {
+        const moderator = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+
+        await service.createAction(moderator.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        const event = await latestAuditEvent('moderation_action_recorded', target.id);
+
+        expect(event?.metadata).toMatchObject({ actionType: 'ban_account', sanctionId: expect.any(String) });
+      });
+
+      it('account sanction with a duration: metadata carries durationSeconds', async () => {
+        const moderator = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+
+        await service.createAction(moderator.id, kase.id, {
+          actionType: 'suspend_account',
+          targetType: 'profile',
+          targetId: target.id,
+          reasonCode: 'spam',
+          details: { durationSeconds: 3600 },
+        });
+        const event = await latestAuditEvent('moderation_action_recorded', target.id);
+
+        expect(event?.metadata).toMatchObject({ durationSeconds: 3600 });
+      });
+
+      it('community restriction: metadata carries sanctionId and communityId', async () => {
+        const moderator = await makeUser();
+        const target = await makeUser();
+        const owner = await makeUser();
+        const community = await makeCommunity(owner.id);
+        await makeMembership(community.id, target.id);
+        const kase = await makeCase('community');
+
+        await service.createAction(moderator.id, kase.id, {
+          actionType: 'restrict_community_participation',
+          targetType: 'profile',
+          targetId: target.id,
+          reasonCode: 'spam',
+          details: { communityId: community.id },
+        });
+        const event = await latestAuditEvent('moderation_action_recorded', target.id);
+
+        expect(event?.metadata).toMatchObject({ actionType: 'restrict_community_participation', sanctionId: expect.any(String), communityId: community.id });
+      });
+
+      it('atomicity (audit→domain direction): a forced AuditService.record failure leaves no Action/Sanction row', async () => {
+        const moderator = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+
+        const spy = vi.spyOn(audit, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        await expect(
+          service.createAction(moderator.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' }),
+        ).rejects.toThrow('simulated audit failure');
+        spy.mockRestore();
+
+        expect(await prisma.action.count({ where: { targetId: target.id } })).toBe(0);
+        expect(await prisma.sanction.count({ where: { subjectId: target.id } })).toBe(0);
+      });
+
+      it('atomicity (domain→audit direction): a forced domain failure leaves no audit row', async () => {
+        const moderator = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+
+        const existingAction = await prisma.action.create({
+          data: { caseId: kase.id, targetType: 'profile', targetId: target.id, actionType: 'ban_account', scope: 'platform', reasonCode: 'spam' },
+        });
+        await prisma.sanction.create({
+          data: { subjectType: 'user', subjectId: target.id, scope: 'platform', sanctionType: 'account_banned', reasonCode: 'spam', sourceActionId: existingAction.id },
+        });
+
+        await expect(
+          service.createAction(moderator.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' }),
+        ).rejects.toThrow(ConflictException);
+
+        expect(await prisma.auditEvent.count({ where: { eventType: 'moderation_action_recorded', subjectId: target.id } })).toBe(0);
+      });
+
+      it('warn_user: performs the Action insert and the audit write inside exactly one $transaction call', async () => {
+        const moderator = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase();
+
+        const spy = vi.spyOn(prisma, '$transaction');
+        await service.createAction(moderator.id, kase.id, { actionType: 'warn_user', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        expect(spy).toHaveBeenCalledTimes(1);
+        spy.mockRestore();
+      });
+    });
+
+    describe('moderation_action_reversed', () => {
+      it('records actor/subject/reason/metadata, occurredAt matching the reversal Action row', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const author = await makeUser();
+        const post = await makePost(author.id);
+        const kase = await makeCase('content');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'remove_content', targetType: 'post', targetId: post.id, reasonCode: 'spam' });
+
+        const reversal = await service.reverseAction(reverser.id, original.id, { reasonCode: 'other' });
+        const event = await latestAuditEvent('moderation_action_reversed', post.id);
+
+        expect(event?.actorId).toBe(reverser.id);
+        expect(event?.subjectType).toBe('post');
+        expect(event?.subjectId).toBe(post.id);
+        expect(event?.reason).toBe('other');
+        expect(event?.metadata).toEqual({ actionType: 'remove_content', originalActionId: original.id });
+        expect(event?.occurredAt.getTime()).toBe(reversal.createdAt.getTime());
+      });
+
+      it('atomicity (audit→domain direction): a forced AuditService.record failure leaves the sanction active and un-lifted', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        const spy = vi.spyOn(audit, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        await expect(service.reverseAction(reverser.id, original.id, { reasonCode: 'other' })).rejects.toThrow('simulated audit failure');
+        spy.mockRestore();
+
+        expect(await prisma.action.count({ where: { reversalOfActionId: original.id } })).toBe(0);
+        const user = await prisma.user.findUniqueOrThrow({ where: { id: target.id } });
+        expect(user.status).toBe('banned'); // NOT lifted — rolled back with everything else
+      });
+
+      it('atomicity (domain→audit direction): a forced domain failure (liftAccountSanction) leaves no audit row', async () => {
+        const actor = await makeUser();
+        const reverser = await makeUser();
+        const target = await makeUser();
+        const kase = await makeCase('platform');
+        const original = await service.createAction(actor.id, kase.id, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+
+        const spy = vi.spyOn(accountSanction, 'liftAccountSanction').mockRejectedValueOnce(new Error('simulated domain failure'));
+        await expect(service.reverseAction(reverser.id, original.id, { reasonCode: 'other' })).rejects.toThrow('simulated domain failure');
+        spy.mockRestore();
+
+        expect(await prisma.auditEvent.count({ where: { eventType: 'moderation_action_reversed', subjectId: target.id } })).toBe(0);
       });
     });
   });

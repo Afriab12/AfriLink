@@ -4,6 +4,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { ActionsService } from './actions.service';
 import { ContentModerationService } from '../content/content-moderation.service';
 import { MessagingModerationService } from '../messaging/messaging-moderation.service';
+import { AuditService } from '../audit/audit.service';
 import { ConflictException, ForbiddenActionException, ResourceNotFoundException, ValidationFailedException } from '../common/errors/api-exception';
 import type { DecideAppealDto } from './dto/decide-appeal.dto';
 
@@ -45,6 +46,7 @@ export class AppealsService {
     private readonly actionsService: ActionsService,
     private readonly contentModeration: ContentModerationService,
     private readonly messagingModeration: MessagingModerationService,
+    private readonly audit: AuditService,
   ) {}
 
   async decideAppeal(reviewerId: string, appealId: string, dto: DecideAppealDto): Promise<AppealResponse> {
@@ -64,13 +66,33 @@ export class AppealsService {
       // only the one that happens to reuse reverseAction.
       await this.assertNotSelfTargeting(reviewerId, appeal.action.targetType, appeal.action.targetId);
 
-      const updated = await this.prisma.appeal.updateMany({
-        where: { id: appealId, state: { in: ['submitted', 'under_review'] } },
-        data: { state: 'upheld', reviewerId, decision: dto.notes ?? null, decidedAt: new Date() },
+      // Wrapped in its own $transaction (previously a single statement) so
+      // the mandatory moderation_appeal_decided write is atomic with the
+      // Appeal state update — approved judgment call #2, Audit B design
+      // review.
+      await this.prisma.$transaction(async (tx) => {
+        const decidedAt = new Date();
+        const updated = await tx.appeal.updateMany({
+          where: { id: appealId, state: { in: ['submitted', 'under_review'] } },
+          data: { state: 'upheld', reviewerId, decision: dto.notes ?? null, decidedAt },
+        });
+        if (updated.count === 0) {
+          throw new ConflictException('CONFLICT', 'This appeal has already been decided.');
+        }
+
+        await this.audit.record(
+          {
+            eventType: 'moderation_appeal_decided',
+            actorId: reviewerId,
+            subjectType: appeal.action.targetType,
+            subjectId: appeal.action.targetId,
+            reason: dto.notes,
+            metadata: { appealId, actionId: appeal.actionId, decision: 'upheld' },
+            occurredAt: decidedAt,
+          },
+          tx,
+        );
       });
-      if (updated.count === 0) {
-        throw new ConflictException('CONFLICT', 'This appeal has already been decided.');
-      }
       return this.getAppeal(appealId);
     }
 
@@ -80,16 +102,23 @@ export class AppealsService {
     }
 
     await this.prisma.$transaction(async (tx) => {
+      const decidedAt = new Date();
       const updated = await tx.appeal.updateMany({
         where: { id: appealId, state: { in: ['submitted', 'under_review'] } },
-        data: { state: 'overturned', reviewerId, decision: dto.notes ?? null, decidedAt: new Date() },
+        data: { state: 'overturned', reviewerId, decision: dto.notes ?? null, decidedAt },
       });
       if (updated.count === 0) {
         throw new ConflictException('CONFLICT', 'This appeal has already been decided.');
       }
 
+      // reversalActionId stays undefined on the no-op path below — no
+      // moderation_action_reversed event was emitted (reverseAction bailed
+      // out before creating anything), so none is referenced here either
+      // (approved judgment call #6, Audit B design review).
+      let reversalActionId: string | undefined;
       try {
-        await this.actionsService.reverseAction(reviewerId, appeal.actionId, { reasonCode: dto.reasonCode! }, tx);
+        const reversal = await this.actionsService.reverseAction(reviewerId, appeal.actionId, { reasonCode: dto.reasonCode! }, tx);
+        reversalActionId = reversal.id;
       } catch (error) {
         // Approved decision: a sanction that's no longer active (already
         // superseded by a later escalation, or already reversed directly)
@@ -102,6 +131,19 @@ export class AppealsService {
           throw error;
         }
       }
+
+      await this.audit.record(
+        {
+          eventType: 'moderation_appeal_decided',
+          actorId: reviewerId,
+          subjectType: appeal.action.targetType,
+          subjectId: appeal.action.targetId,
+          reason: dto.notes,
+          metadata: { appealId, actionId: appeal.actionId, decision: 'overturned', ...(reversalActionId ? { reversalActionId } : {}) },
+          occurredAt: decidedAt,
+        },
+        tx,
+      );
     });
 
     return this.getAppeal(appealId);

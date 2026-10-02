@@ -5,6 +5,7 @@ import { ContentModerationService } from '../content/content-moderation.service'
 import { MessagingModerationService } from '../messaging/messaging-moderation.service';
 import { CommunityModerationService } from '../communities/community-moderation.service';
 import { AccountSanctionService } from '../auth/account-sanction.service';
+import { AuditService } from '../audit/audit.service';
 import { ActionsService } from './actions.service';
 import { AppealsService } from './appeals.service';
 import { ConflictException, ForbiddenActionException, ResourceNotFoundException, ValidationFailedException } from '../common/errors/api-exception';
@@ -16,6 +17,7 @@ import { ConflictException, ForbiddenActionException, ResourceNotFoundException,
 // creation works; this file exercises decision-making, not creation.
 describe('AppealsService', () => {
   let prisma: PrismaService;
+  let audit: AuditService;
   let actions: ActionsService;
   let accountSanction: AccountSanctionService;
   let service: AppealsService;
@@ -23,12 +25,13 @@ describe('AppealsService', () => {
   beforeAll(async () => {
     prisma = new PrismaService();
     await prisma.onModuleInit();
+    audit = new AuditService(prisma);
     const contentModeration = new ContentModerationService(prisma);
     const messagingModeration = new MessagingModerationService(prisma);
     const communityModeration = new CommunityModerationService(prisma);
     accountSanction = new AccountSanctionService(prisma);
-    actions = new ActionsService(prisma, contentModeration, messagingModeration, communityModeration, accountSanction);
-    service = new AppealsService(prisma, actions, contentModeration, messagingModeration);
+    actions = new ActionsService(prisma, contentModeration, messagingModeration, communityModeration, accountSanction, audit);
+    service = new AppealsService(prisma, actions, contentModeration, messagingModeration, audit);
   });
 
   afterAll(async () => {
@@ -444,6 +447,112 @@ describe('AppealsService', () => {
       const action = await makeAction(actor.id, 'profile', target.id, 'warn_user', 'platform');
 
       await expect(makeAppeal(action.id, 'warn_user', target.id)).rejects.toThrow();
+    });
+  });
+
+  // -------------------------------------------------------- audit (Audit B)
+
+  describe('audit integration', () => {
+    async function latestAuditEvent(eventType: string, subjectId: string) {
+      return prisma.auditEvent.findFirst({ where: { eventType: eventType as never, subjectId }, orderBy: { createdAt: 'desc' } });
+    }
+
+    describe('uphold', () => {
+      it('records a moderation_appeal_decided event, no reversalActionId, inside its own new transaction', async () => {
+        const actor = await makeUser();
+        const reviewer = await makeUser();
+        const target = await makeUser();
+        const action = await makeAction(actor.id, 'profile', target.id, 'ban_account', 'platform');
+        await makeSanction(action.id, 'user', target.id, 'platform', 'account_banned');
+        const appeal = await makeAppeal(action.id, 'ban_account', target.id);
+
+        const spy = vi.spyOn(prisma, '$transaction');
+        await service.decideAppeal(reviewer.id, appeal.id, { decision: 'upheld', notes: 'looked legitimate' });
+        expect(spy).toHaveBeenCalledTimes(1);
+        spy.mockRestore();
+
+        const event = await latestAuditEvent('moderation_appeal_decided', target.id);
+        expect(event?.actorId).toBe(reviewer.id);
+        expect(event?.subjectType).toBe('profile');
+        expect(event?.reason).toBe('looked legitimate');
+        expect(event?.metadata).toEqual({ appealId: appeal.id, actionId: action.id, decision: 'upheld' });
+      });
+
+      it('atomicity (audit→domain direction): a forced AuditService.record failure leaves the Appeal state unchanged', async () => {
+        const actor = await makeUser();
+        const reviewer = await makeUser();
+        const target = await makeUser();
+        const action = await makeAction(actor.id, 'profile', target.id, 'ban_account', 'platform');
+        await makeSanction(action.id, 'user', target.id, 'platform', 'account_banned');
+        const appeal = await makeAppeal(action.id, 'ban_account', target.id);
+
+        const spy = vi.spyOn(audit, 'record').mockRejectedValueOnce(new Error('simulated audit failure'));
+        await expect(service.decideAppeal(reviewer.id, appeal.id, { decision: 'upheld' })).rejects.toThrow('simulated audit failure');
+        spy.mockRestore();
+
+        const reloaded = await prisma.appeal.findUniqueOrThrow({ where: { id: appeal.id } });
+        expect(reloaded.state).toBe('submitted');
+        expect(reloaded.decidedAt).toBeNull();
+      });
+    });
+
+    describe('overturn', () => {
+      it('reversal succeeds: metadata.reversalActionId matches the created reversal Action id, occurredAt matches decidedAt', async () => {
+        const actor = await makeUser();
+        const reviewer = await makeUser();
+        const target = await makeUser();
+        const action = await makeAction(actor.id, 'profile', target.id, 'ban_account', 'platform');
+        await makeSanction(action.id, 'user', target.id, 'platform', 'account_banned');
+        await applySanctionedState(target.id, 'banned');
+        const appeal = await makeAppeal(action.id, 'ban_account', target.id);
+
+        await service.decideAppeal(reviewer.id, appeal.id, { decision: 'overturned', reasonCode: 'other', notes: 'reviewed' });
+
+        const reversal = await prisma.action.findFirstOrThrow({ where: { reversalOfActionId: action.id } });
+        const reversedEvent = await latestAuditEvent('moderation_action_reversed', target.id);
+        expect(reversedEvent?.metadata).toEqual({ actionType: 'ban_account', originalActionId: action.id });
+
+        const decidedEvent = await latestAuditEvent('moderation_appeal_decided', target.id);
+        expect(decidedEvent?.actorId).toBe(reviewer.id);
+        expect(decidedEvent?.reason).toBe('reviewed');
+        expect(decidedEvent?.metadata).toEqual({ appealId: appeal.id, actionId: action.id, decision: 'overturned', reversalActionId: reversal.id });
+
+        const reloadedAppeal = await prisma.appeal.findUniqueOrThrow({ where: { id: appeal.id } });
+        expect(decidedEvent?.occurredAt.getTime()).toBe(reloadedAppeal.decidedAt!.getTime());
+      });
+
+      it('nothing live to reverse: exactly one moderation_appeal_decided event, zero moderation_action_reversed events, no reversalActionId', async () => {
+        const actor = await makeUser();
+        const reviewer = await makeUser();
+        const target = await makeUser();
+        const suspendAction = await makeAction(actor.id, 'profile', target.id, 'suspend_account', 'platform');
+        await makeSanction(suspendAction.id, 'user', target.id, 'platform', 'account_suspended');
+        await actions.createAction(actor.id, suspendAction.caseId, { actionType: 'ban_account', targetType: 'profile', targetId: target.id, reasonCode: 'spam' });
+        const appeal = await makeAppeal(suspendAction.id, 'suspend_account', target.id);
+
+        await service.decideAppeal(reviewer.id, appeal.id, { decision: 'overturned', reasonCode: 'other' });
+
+        expect(await prisma.auditEvent.count({ where: { eventType: 'moderation_action_reversed', subjectId: target.id } })).toBe(0);
+        const decidedEvents = await prisma.auditEvent.findMany({ where: { eventType: 'moderation_appeal_decided', subjectId: target.id } });
+        expect(decidedEvents).toHaveLength(1);
+        expect(decidedEvents[0].metadata).toEqual({ appealId: appeal.id, actionId: suspendAction.id, decision: 'overturned' });
+      });
+
+      it('atomicity (domain→audit direction): a forced genuine failure inside the reused reversal leaves no audit rows at all', async () => {
+        const actor = await makeUser();
+        const reviewer = await makeUser();
+        const target = await makeUser();
+        const action = await makeAction(actor.id, 'profile', target.id, 'ban_account', 'platform');
+        await makeSanction(action.id, 'user', target.id, 'platform', 'account_banned');
+        await applySanctionedState(target.id, 'banned');
+        const appeal = await makeAppeal(action.id, 'ban_account', target.id);
+
+        const spy = vi.spyOn(accountSanction, 'liftAccountSanction').mockRejectedValueOnce(new Error('simulated domain failure'));
+        await expect(service.decideAppeal(reviewer.id, appeal.id, { decision: 'overturned', reasonCode: 'other' })).rejects.toThrow('simulated domain failure');
+        spy.mockRestore();
+
+        expect(await prisma.auditEvent.count({ where: { subjectId: target.id } })).toBe(0);
+      });
     });
   });
 });
