@@ -153,7 +153,7 @@ datasource db {
   provider   = "postgresql"
   // Connection URL moved to prisma7.config.ts (Prisma 7 no longer accepts
   // `url` directly in schema.prisma — see database/prisma7.config.ts).
-  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "notification", "media", "moderation", "integration"]
+  schemas    = ["identity", "reference", "social", "content", "community", "messaging", "notification", "media", "moderation", "integration", "audit"]
   extensions = [citext]
 }
 
@@ -1661,4 +1661,56 @@ model IdempotencyKey {
   @@id([ownerId, key, commandType])
   @@map("idempotency_keys")
   @@schema("integration")
+}
+
+// ============================================================
+// audit schema — docs/04-database/audit.md
+// ============================================================
+
+enum AuditEventType {
+  auth_login_succeeded
+  auth_account_verified
+  auth_password_reset_requested
+  auth_password_reset_completed
+  auth_session_revoked
+  auth_all_sessions_revoked
+  moderation_action_recorded
+  moderation_action_reversed
+  moderation_appeal_decided
+
+  @@schema("audit")
+}
+
+model AuditEvent {
+  id            String         @id @default(uuid(7)) @db.Uuid
+  eventType     AuditEventType @map("event_type")
+  // Polymorphic, no FK — deliberately: an audit row must survive even if
+  // the referenced user/row is later hard-deleted or anonymized. Null
+  // actorId = system/automated actor, same precedent as Action.actorId.
+  actorId       String?        @map("actor_id") @db.Uuid
+  subjectType   String?        @map("subject_type")
+  subjectId     String?        @map("subject_id") @db.Uuid
+  requestId     String?        @map("request_id")
+  // Reserved — unpopulated until OpenTelemetry is actually installed.
+  traceId       String?        @map("trace_id")
+  ipHash        String?        @map("ip_hash")
+  userAgentHash String?        @map("user_agent_hash")
+  reason        String?
+  // Shape enforced at the application layer per eventType (a strict,
+  // allowlisted DTO per event type) — never passwords, tokens, message
+  // bodies, or raw request/response payloads.
+  metadata      Json
+  occurredAt    DateTime       @map("occurred_at") @db.Timestamptz
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  // No updatedAt, no deletedAt — append-only by convention (matches
+  // moderation.actions), and a soft-delete column serves no purpose for
+  // an immutable compliance ledger. A future retention sweep hard-deletes
+  // rows past whatever period is eventually approved, filtering on
+  // occurredAt/createdAt directly.
+
+  @@index([eventType, occurredAt(sort: Desc)])
+  @@index([actorId, occurredAt(sort: Desc)])
+  @@index([subjectType, subjectId, occurredAt(sort: Desc)])
+  @@map("events")
+  @@schema("audit")
 }
