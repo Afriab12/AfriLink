@@ -3,6 +3,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { SocialGraphController } from './social-graph.controller';
 import { SocialGraphService } from './social-graph.service';
 import { ProfilesModule } from '../profiles/profiles.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
@@ -12,6 +13,9 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
     // Reuses ProfileVisibilityService exported by ProfilesModule — same
     // instance, same rule, not a re-declared copy (judgment call 6).
     ProfilesModule,
+    // NotificationsService is the producer-facing record() entry point
+    // (Notifications A1).
+    NotificationsModule,
     JwtModule.register({
       secret: process.env.JWT_ACCESS_SECRET,
     }),

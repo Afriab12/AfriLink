@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { Friendship } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ProfileVisibilityService } from '../profiles/profile-visibility.service';
+import { NotificationsService, type RecordNotificationInput } from '../notifications/notifications.service';
 import { ConflictException, PolicyRejectedException, ResourceNotFoundException } from '../common/errors/api-exception';
 
 export interface FriendshipResponse {
@@ -18,7 +19,20 @@ export class SocialGraphService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly visibility: ProfileVisibilityService,
+    private readonly notifications: NotificationsService,
   ) {}
+
+  // Best-effort only (Notifications A1, decision #4) — a notification
+  // write failure must never fail the originating social-graph operation.
+  // Same pattern as AuthService.recordBestEffortAudit (Audit C); the log
+  // line names only the notification type, nothing else.
+  private async recordBestEffortNotification(input: RecordNotificationInput): Promise<void> {
+    try {
+      await this.notifications.record(input);
+    } catch {
+      console.warn(`[notifications] best-effort notification "${input.type}" failed to record`);
+    }
+  }
 
   private toFriendshipResponse(f: Friendship): FriendshipResponse {
     return {
@@ -47,7 +61,22 @@ export class SocialGraphService {
       where: { followerId: viewerId, followeeId: targetId, deletedAt: null },
     });
     if (!existing) {
-      await this.prisma.follow.create({ data: { followerId: viewerId, followeeId: targetId } });
+      // A brand-new Follow row only exists on this branch — whether this
+      // is the first-ever follow or a re-follow after an unfollow (a new
+      // row, not a reactivated one, per this method's own lifecycle).
+      // dedupKey is tied to the row's own id, not the static (follower,
+      // followee) pair, so a legitimate re-follow is never suppressed by
+      // the stale dedupKey from the earlier, since-dismissed notification
+      // (Notifications A1, decision #7).
+      const follow = await this.prisma.follow.create({ data: { followerId: viewerId, followeeId: targetId } });
+      await this.recordBestEffortNotification({
+        type: 'follow_received',
+        recipientUserId: targetId,
+        actorUserId: viewerId,
+        targetType: 'follow',
+        targetId: follow.id,
+        dedupKey: `follow:${follow.id}`,
+      });
     }
     return { following: true };
   }
@@ -120,6 +149,14 @@ export class SocialGraphService {
     }
 
     const friendship = await this.prisma.friendship.create({ data: { requesterId, addresseeId } });
+    await this.recordBestEffortNotification({
+      type: 'friend_request_received',
+      recipientUserId: addresseeId,
+      actorUserId: requesterId,
+      targetType: 'friendship',
+      targetId: friendship.id,
+      dedupKey: `friend_request:${friendship.id}`,
+    });
     return this.toFriendshipResponse(friendship);
   }
 
@@ -131,6 +168,14 @@ export class SocialGraphService {
     const updated = await this.prisma.friendship.update({
       where: { id: friendshipId },
       data: { status: 'accepted', respondedAt: new Date() },
+    });
+    await this.recordBestEffortNotification({
+      type: 'friend_request_accepted',
+      recipientUserId: friendship.requesterId,
+      actorUserId: userId,
+      targetType: 'friendship',
+      targetId: friendshipId,
+      dedupKey: `friend_request_accepted:${friendshipId}`,
     });
     return this.toFriendshipResponse(updated);
   }

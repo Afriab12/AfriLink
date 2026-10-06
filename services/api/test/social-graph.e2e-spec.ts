@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { NotificationsService } from '../src/notifications/notifications.service';
 
 function extractCookies(res: request.Response): Record<string, string> {
   const setCookie = res.headers['set-cookie'];
@@ -422,6 +423,198 @@ describe('Social graph (e2e)', () => {
         .post(`/api/v1/users/${b.userId}/block`)
         .set('Cookie', cookieHeader(a.cookies, 'afrilink_at', 'afrilink_csrf'))
         .expect(403);
+    });
+  });
+
+  // ============================================================
+  // Notifications A1 — social graph producers
+  // ============================================================
+
+  describe('Notifications (A1 producers)', () => {
+    async function latestNotification(type: string, recipientUserId: string) {
+      return prisma.notification.findFirst({ where: { type, recipientUserId }, orderBy: { createdAt: 'desc' } });
+    }
+
+    describe('follow_received', () => {
+      it('records actor/recipient/target/dedupKey on a new follow', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+
+        const follow = await prisma.follow.findFirstOrThrow({ where: { followerId: a.userId, followeeId: b.userId, deletedAt: null } });
+        const event = await latestNotification('follow_received', b.userId);
+        expect(event?.actorUserId).toBe(a.userId);
+        expect(event?.targetType).toBe('follow');
+        expect(event?.targetId).toBe(follow.id);
+        expect(event?.dedupKey).toBe(`follow:${follow.id}`);
+      });
+
+      it('repeating the identical follow call creates exactly one notification (business-level idempotency)', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+
+        const count = await prisma.notification.count({ where: { type: 'follow_received', recipientUserId: b.userId, actorUserId: a.userId } });
+        expect(count).toBe(1);
+      });
+
+      it('unfollow then re-follow is a genuinely new event: a second, distinct notification is created', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+        await request(app.getHttpServer()).delete(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(200);
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+
+        const count = await prisma.notification.count({ where: { type: 'follow_received', recipientUserId: b.userId, actorUserId: a.userId } });
+        expect(count).toBe(2);
+        const follows = await prisma.follow.findMany({ where: { followerId: a.userId, followeeId: b.userId } });
+        expect(follows).toHaveLength(2); // unfollow soft-deletes; re-follow creates a new row, per the actual lifecycle
+      });
+
+      it('is best-effort: follow still succeeds (201) even if NotificationsService.record() fails', async () => {
+        const notifications = app.get(NotificationsService);
+        const a = await registerUser();
+        const b = await registerUser();
+
+        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+        spy.mockRestore();
+
+        const followers = await request(app.getHttpServer()).get(`/api/v1/users/${b.userId}/followers`).expect(200);
+        expect(followers.body.data.map((f: { userId: string }) => f.userId)).toContain(a.userId);
+      });
+    });
+
+    describe('friend_request_received', () => {
+      it('records actor/recipient/target/dedupKey on a new friend request', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+
+        const res = await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(201);
+        const friendshipId = res.body.data.id as string;
+
+        const event = await latestNotification('friend_request_received', b.userId);
+        expect(event?.actorUserId).toBe(a.userId);
+        expect(event?.targetType).toBe('friendship');
+        expect(event?.targetId).toBe(friendshipId);
+        expect(event?.dedupKey).toBe(`friend_request:${friendshipId}`);
+      });
+
+      it('a duplicate (already-pending) request is rejected and creates no second notification', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(201);
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(409);
+
+        const count = await prisma.notification.count({ where: { type: 'friend_request_received', recipientUserId: b.userId } });
+        expect(count).toBe(1);
+      });
+
+      it('is best-effort: sending a friend request still succeeds (201) even if recording fails', async () => {
+        const notifications = app.get(NotificationsService);
+        const a = await registerUser();
+        const b = await registerUser();
+
+        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(201);
+        spy.mockRestore();
+      });
+    });
+
+    describe('friend_request_accepted', () => {
+      it('records actor (accepter) / recipient (original requester) / target/dedupKey', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+        const sendRes = await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(201);
+        const friendshipId = sendRes.body.data.id as string;
+
+        await request(app.getHttpServer()).post(`/api/v1/friend-requests/${friendshipId}/accept`).set(auth(b)).expect(200);
+
+        const event = await latestNotification('friend_request_accepted', a.userId);
+        expect(event?.actorUserId).toBe(b.userId);
+        expect(event?.targetType).toBe('friendship');
+        expect(event?.targetId).toBe(friendshipId);
+        expect(event?.dedupKey).toBe(`friend_request_accepted:${friendshipId}`);
+      });
+
+      it('a second accept attempt on the same (now-accepted) friendship is rejected and creates no second notification', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+        const sendRes = await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(201);
+        const friendshipId = sendRes.body.data.id as string;
+
+        await request(app.getHttpServer()).post(`/api/v1/friend-requests/${friendshipId}/accept`).set(auth(b)).expect(200);
+        await request(app.getHttpServer()).post(`/api/v1/friend-requests/${friendshipId}/accept`).set(auth(b)).expect(404);
+
+        const count = await prisma.notification.count({ where: { type: 'friend_request_accepted', recipientUserId: a.userId } });
+        expect(count).toBe(1);
+      });
+
+      it('is best-effort: accepting still succeeds (200) even if recording fails', async () => {
+        const notifications = app.get(NotificationsService);
+        const a = await registerUser();
+        const b = await registerUser();
+        const sendRes = await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(201);
+        const friendshipId = sendRes.body.data.id as string;
+
+        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+        await request(app.getHttpServer()).post(`/api/v1/friend-requests/${friendshipId}/accept`).set(auth(b)).expect(200);
+        spy.mockRestore();
+      });
+    });
+
+    describe('self-notification safety', () => {
+      it('NotificationsService.record() silently no-ops when actorUserId === recipientUserId, rather than throwing the DB CHECK', async () => {
+        const notifications = app.get(NotificationsService);
+        const a = await registerUser();
+
+        const before = await prisma.notification.count({ where: { recipientUserId: a.userId } });
+        await expect(
+          notifications.record({ type: 'follow_received', recipientUserId: a.userId, actorUserId: a.userId, targetType: 'follow', targetId: randomUUID() }),
+        ).resolves.toBeUndefined();
+        const after = await prisma.notification.count({ where: { recipientUserId: a.userId } });
+        expect(after).toBe(before);
+      });
+    });
+
+    describe('authorization', () => {
+      it("the actor cannot see the recipient's follow_received notification, and cannot mark it read", async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+        const event = await latestNotification('follow_received', b.userId);
+
+        const actorsView = await request(app.getHttpServer()).get('/api/v1/notifications').set('Cookie', cookieHeader(a.cookies, 'afrilink_at')).expect(200);
+        expect(actorsView.body.data.map((n: { id: string }) => n.id)).not.toContain(event!.id);
+
+        await request(app.getHttpServer()).post(`/api/v1/notifications/${event!.id}/read`).set(auth(a)).expect(404);
+
+        const recipientsView = await request(app.getHttpServer())
+          .get('/api/v1/notifications')
+          .set('Cookie', cookieHeader(b.cookies, 'afrilink_at'))
+          .expect(200);
+        expect(recipientsView.body.data.map((n: { id: string }) => n.id)).toContain(event!.id);
+      });
+    });
+
+    describe('payload safety', () => {
+      it('all three A1 notification types carry no payload beyond targetType/targetId/actorUserId', async () => {
+        const a = await registerUser();
+        const b = await registerUser();
+        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+        const sendRes = await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/friend-requests`).set(auth(a)).expect(201);
+        await request(app.getHttpServer()).post(`/api/v1/friend-requests/${sendRes.body.data.id}/accept`).set(auth(b)).expect(200);
+
+        for (const type of ['follow_received', 'friend_request_received', 'friend_request_accepted']) {
+          const row = await prisma.notification.findFirst({ where: { type }, orderBy: { createdAt: 'desc' } });
+          expect(row?.payload == null || Object.keys(row.payload as object).length === 0).toBe(true);
+        }
+      });
     });
   });
 });

@@ -17,5 +17,8 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
   ],
   controllers: [NotificationsController],
   providers: [NotificationsService, JwtAuthGuard, CsrfGuard],
+  // Exported for Notifications A1 — SocialGraphModule injects
+  // NotificationsService as the producer-facing record() entry point.
+  exports: [NotificationsService],
 })
 export class NotificationsModule {}

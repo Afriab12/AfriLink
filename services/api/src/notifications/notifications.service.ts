@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
-import type { Notification, Prisma, UserStatus } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import type { Notification, UserStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ProfileVisibilityService } from '../profiles/profile-visibility.service';
 import { InvalidCursorException, ResourceNotFoundException } from '../common/errors/api-exception';
@@ -34,6 +35,24 @@ export interface NotificationResponse {
   createdAt: Date;
 }
 
+// Producer-facing input (Notifications A1). Deliberately a small, generic
+// shape — not a per-type discriminated union like AuditEventInput — since
+// there is no approved type vocabulary to close over yet (database.md
+// §10). `type` stays a free string by design.
+export interface RecordNotificationInput {
+  type: string;
+  recipientUserId: string;
+  actorUserId: string | null;
+  targetType?: string;
+  targetId?: string;
+  // Deterministic, caller-supplied — this IS the dedup mechanism (unique
+  // per recipient, database.md §10); callers must derive it from a stable
+  // domain-row id, never from a value that recurs across logically
+  // distinct events.
+  dedupKey?: string;
+  payload?: Prisma.InputJsonValue;
+}
+
 interface ActorRow {
   id: string;
   handle: string | null;
@@ -50,6 +69,44 @@ export class NotificationsService {
     private readonly prisma: PrismaService,
     private readonly visibility: ProfileVisibilityService,
   ) {}
+
+  // Centralized producer entry point (Notifications A1, Option B). Callers
+  // are responsible for atomicity classification themselves (all A1
+  // producers are best-effort — see each producer's own wrapper); this
+  // method is deliberately unopinionated about that.
+  //
+  // Self-notification: defensively no-ops rather than letting the DB CHECK
+  // (`notifications_no_self_notify_check`) throw — every current producer
+  // already guards against this upstream, so this path is not expected to
+  // be reached in practice, but the service does not trust callers alone.
+  //
+  // Deduplication: `dedupKey` collisions (the unique
+  // `(recipientUserId, dedupKey)` index) are treated as an expected,
+  // successful no-op — "already recorded" is not a failure a caller's
+  // best-effort wrapper should ever see or log.
+  async record(input: RecordNotificationInput): Promise<void> {
+    if (input.actorUserId !== null && input.actorUserId === input.recipientUserId) {
+      return;
+    }
+    try {
+      await this.prisma.notification.create({
+        data: {
+          type: input.type,
+          recipientUserId: input.recipientUserId,
+          actorUserId: input.actorUserId,
+          targetType: input.targetType,
+          targetId: input.targetId,
+          dedupKey: input.dedupKey,
+          payload: input.payload,
+        },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        return;
+      }
+      throw error;
+    }
+  }
 
   // The rows this recipient may see, as AND-ed conditions (AND, because the
   // block filter and the cursor each need their own OR and would otherwise
