@@ -49,7 +49,7 @@ Applied to the messaging and notifications work, and the method to keep using fo
 
 `test/notifications.e2e-spec.ts` covers the four implemented routes (`api.md` §15) with 47 tests.
 
-**How it is tested: seeded rows.** There are no notification producers yet: nothing in the application creates a notification. The tests therefore **insert notification rows directly through Prisma**, with an opaque `type` value, and register the users through the real registration API. The API is exercised end to end from HTTP down to the database, but the *creation* of a notification is not.
+**API tests use seeded rows; producer tests use real flows.** The notification REST tests insert notification rows directly through Prisma and register users through the real API. Producer behavior is covered end to end in `social-graph.e2e-spec.ts`, `content.e2e-spec.ts` and `communities.e2e-spec.ts`, exercising the originating operation through notification persistence.
 
 What the 47 tests cover:
 - **List:** authentication, ordering and the `id` tie-break, cursor pagination (including across rows with the same timestamp), limit clamping, malformed cursor, exact response fields and no internal fields, `Cache-Control`.
@@ -62,12 +62,10 @@ What the 47 tests cover:
 
 Mutation-checked: 26 deliberate breakages (dropped recipient scope, one-direction blocks, a bare `notIn` that drops system notifications, no cap, non-idempotent read or dismiss, hard delete, leaked fields, missing guards, and others) are each caught by the intended test. The queries were also checked with `EXPLAIN` on about 600,000 notifications and 500,000 block rows: no sequential scan, existing indexes used.
 
-**Not covered yet: future notification-producer integration.** Because nothing creates notifications, none of the following can be tested end to end until producers exist:
-- an event (a reaction, comment, follow, message request, moderation outcome) producing the right notification for the right recipient;
-- deduplication of a replayed event. Today only the database's unique `(recipient_user_id, dedup_key)` constraint is tested, by inserting a duplicate directly, not the producer path that would hit it;
-- grouping and aggregation through `group_key`;
-- suppressing a notification at creation time when the pair is blocked (the API filters on read; a producer should also not create it);
-- user preferences, quiet hours and channel consent (no API over `notification.preferences` exists);
+**Producer coverage and remaining gaps.** A1 tests follow and friend-request notifications. A2 tests post/comment reactions, comments/replies, community membership approval, recipient/actor/target metadata, deterministic deduplication, self-notification handling, blocked-pair suppression and best-effort failures. Still not covered:
+- message-request or moderation notification producers;
+- grouping and aggregation through `group_key` (A2 producers leave it null);
+- user preferences, quiet hours and channel consent (preferences enforcement is deferred; no API over `notification.preferences` exists);
 - deliveries over push, email or SMS (`notification.deliveries` is deferred);
 - retention and purging (no retention period is decided).
 

@@ -31,7 +31,7 @@ flowchart LR
 | Home/community feeds | Feed | `feed` (does not exist yet) | **[Future contract]** |
 | Communities | Communities | `community` (database implemented; no REST API yet) | **[Future contract]** — API not implemented |
 | Messaging | Messaging | `messaging` | **[Implemented]** — REST + WebSocket gateway (§13, ADR-006) |
-| Notifications | Notifications | `notification` (database and REST API implemented) | **[Implemented]** — REST/polling only (§13, §15): list, unread count, mark read, dismiss. Producers, preferences endpoints and read-all are not built. |
+| Notifications | Notifications | `notification` | **[Implemented]** — REST/polling only (§13, §15): list, unread count, mark read and dismiss; producers include A1 social graph and A2 content/community events. Preferences endpoints and read-all are not built. |
 | Media | Media | `media` (does not exist yet) | **[Future contract]** |
 | Moderation | Moderation | `moderation` (does not exist yet) | **[Future contract]** |
 | Admin | Admin & Audit | `admin`, `audit` (do not exist yet) | **[Future contract]** |
@@ -383,7 +383,7 @@ All routes require authentication (JWT). The two state-changing routes also requ
 - **Cursor:** the standard opaque `(createdAt, id)` cursor of §9, ordered `createdAt` descending then `id` descending. This is the same shape as posts, comments and messages, and **not** the `(last_message_at, id)` shape used by `GET /conversations` (§13). A malformed cursor is `400 INVALID_CURSOR`.
 - **Page size:** default 20, maximum 50. An out-of-range `limit` is **clamped, never rejected**, as §9 specifies; only a non-integer is `422` (compare tracked follow-up T-2, §18, for the routes that reject instead).
 - **`unread=true`:** the only filter. Only the literal `true` is accepted; `false`, `0`, `yes` and an empty value are `422 VALIDATION_FAILED` (field `unread`), because it would be ambiguous whether `false` means "read only" or "everything".
-- **Item fields:** `id`, `type`, `actor`, `targetType`, `targetId`, `groupKey`, `payload`, `readAt`, `createdAt`. `dedupKey`, `recipientUserId` and `deletedAt` are never returned. `type` is an opaque string (no type vocabulary is defined yet) and `payload` is returned exactly as stored.
+- **Item fields:** `id`, `type`, `actor`, `targetType`, `targetId`, `groupKey`, `payload`, `readAt`, `createdAt`. `dedupKey`, `recipientUserId` and `deletedAt` are never returned. `type` is a plain string with approved producer values documented in `database.md` §10; `payload` is returned exactly as stored.
 - **`actor`:** `null` for a system notification, and also when the actor is no longer active (suspended, banned, deleted, and so on); the notification is kept, the identity is not shown. `{ "id" }` only when the actor's profile is not public (private, or followers-only). `{ "id", "displayName", "handle" }` for a public profile, including a user who has no profile row yet (the existing visibility rule treats that as public).
 
 **Blocked actors.** A notification whose actor the caller has blocked, **or who has blocked the caller**, is hidden from both the list and the unread count, and reappears if the block is removed. System notifications (no actor) are never hidden by this. `POST /notifications/{id}/read` and `DELETE /notifications/{id}` work on the caller's own notifications regardless of blocks.
@@ -396,10 +396,10 @@ All routes require authentication (JWT). The two state-changing routes also requ
 **Rate limiting: not currently enforced.** No rate limit applies to these routes, and no Notifications-specific limits are defined yet; a future account-keyed policy remains to be decided and implemented (see the implementation status in §11).
 
 **Not built (this is what "implemented" does not cover)**
-- **Notification producers.** Nothing creates notifications yet, so today the API returns whatever rows exist; it has been exercised with seeded rows (`docs/08-testing/testing.md`).
-- **Preferences endpoints** (`/notification-preferences`), even though the table exists.
+- **Notification producers.** A1 producers cover follows and friend requests; A2 producers cover post/comment reactions, comments/replies and community membership approval. Messaging and moderation notification producers are not implemented.
+- **Preferences endpoints** (`/notification-preferences`) and producer preference enforcement, even though the table exists; both require a separate product/API design decision.
 - **Read-all**, deferred by the owner for the MVP and not part of the approved scope.
-- **Deliveries** (push, email, SMS) and the notification **type/category vocabulary**: both still open decisions (`database.md` §10).
+- **Deliveries** (push, email, SMS) and notification preferences remain deferred. Implemented producer type strings are documented in the producer implementations; the database field remains plain text.
 - **Retention:** no retention period has been decided and nothing purges or expires notification rows.
 
 ## 16. Database consistency findings

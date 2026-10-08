@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { NotificationsService } from '../src/notifications/notifications.service';
 
 function extractCookies(res: request.Response): Record<string, string> {
   const setCookie = res.headers['set-cookie'];
@@ -126,6 +127,10 @@ describe('Communities (e2e)', () => {
 
   async function rows(communityId: string, userId: string) {
     return prisma.communityMembership.findMany({ where: { communityId, userId }, orderBy: { createdAt: 'asc' } });
+  }
+
+  async function approvalNotifications(recipientUserId: string) {
+    return prisma.notification.findMany({ where: { type: 'community_membership_approved', recipientUserId } });
   }
 
   async function activeMember(communityId: string, role = 'member'): Promise<U> {
@@ -796,6 +801,15 @@ describe('Communities (e2e)', () => {
       expect(r).toMatchObject({ status: 'active', approvedBy: owner.userId });
       expect(r.approvedAt).not.toBeNull();
       expect((await get(requester, `/communities/${c.id}`)).body.data.viewer.role).toBe('member');
+      const event = (await approvalNotifications(requester.userId))[0];
+      expect(event).toMatchObject({
+        actorUserId: owner.userId,
+        targetType: 'community',
+        targetId: c.id,
+        groupKey: null,
+        dedupKey: `community_membership_approved:${r.id}`,
+        payload: null,
+      });
     });
 
     it('a moderator can approve and reject; a plain member and an outsider cannot', async () => {
@@ -812,6 +826,7 @@ describe('Communities (e2e)', () => {
 
       await post(mod, `/communities/${c.id}/members/${requester.userId}/approve`).expect(200);
       expect((await rows(c.id, requester.userId))[0]).toMatchObject({ status: 'active', approvedBy: mod.userId });
+      expect((await approvalNotifications(requester.userId))[0].actorUserId).toBe(mod.userId);
     });
 
     it('approving is idempotent for an already-active member', async () => {
@@ -820,6 +835,32 @@ describe('Communities (e2e)', () => {
       const again = await post(owner, `/communities/${c.id}/members/${requester.userId}/approve`).expect(200);
       expect(again.body.data.status).toBe('active');
       expect(await rows(c.id, requester.userId)).toHaveLength(1);
+      expect(await approvalNotifications(requester.userId)).toHaveLength(1);
+    });
+
+    it('keeps membership approval successful when notification recording fails', async () => {
+      const { owner, c, requester } = await pendingRequest();
+      const notifications = app.get(NotificationsService);
+      const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+
+      await post(owner, `/communities/${c.id}/members/${requester.userId}/approve`).expect(200);
+      spy.mockRestore();
+      expect((await rows(c.id, requester.userId))[0]).toMatchObject({ status: 'active', approvedBy: owner.userId });
+      expect(await approvalNotifications(requester.userId)).toHaveLength(0);
+    });
+
+    it.each([
+      ['owner blocks applicant', 'owner'],
+      ['applicant blocks owner', 'applicant'],
+    ])('approves membership but suppresses the notification when the pair is blocked (%s)', async (_label, blocker) => {
+      const { owner, c, requester } = await pendingRequest();
+      const blockerUser = blocker === 'owner' ? owner : requester;
+      const blockedUser = blocker === 'owner' ? requester : owner;
+      await post(blockerUser, `/users/${blockedUser.userId}/block`).expect(201);
+
+      await post(owner, `/communities/${c.id}/members/${requester.userId}/approve`).expect(200);
+      expect((await rows(c.id, requester.userId))[0]).toMatchObject({ status: 'active', approvedBy: owner.userId });
+      expect(await approvalNotifications(requester.userId)).toHaveLength(0);
     });
 
     it.each(['left', 'rejected', 'removed', 'banned'] as const)('approving someone whose membership is %s is 404 (there is no pending request), and changes nothing', async (status) => {

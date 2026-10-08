@@ -6,6 +6,8 @@ import { InvalidCursorException, ResourceNotFoundException } from '../common/err
 import { clampLimit, decodeCursor, toPage } from '../common/pagination/cursor';
 import type { CreateCommentDto } from './dto/create-comment.dto';
 import type { UpdateCommentDto } from './dto/update-comment.dto';
+import { NotificationsService, type RecordNotificationInput } from '../notifications/notifications.service';
+import { ProfileVisibilityService } from '../profiles/profile-visibility.service';
 
 export interface CommentResponse {
   id: string;
@@ -23,7 +25,24 @@ export class CommentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly postAccess: PostAccessService,
+    private readonly notifications: NotificationsService,
+    private readonly visibility: ProfileVisibilityService,
   ) {}
+
+  private async recordBestEffortNotification(input: RecordNotificationInput): Promise<void> {
+    try {
+      if (
+        input.actorUserId !== null &&
+        input.actorUserId !== input.recipientUserId &&
+        (await this.visibility.isBlocked(input.actorUserId, input.recipientUserId))
+      ) {
+        return;
+      }
+      await this.notifications.record(input);
+    } catch {
+      console.warn(`[notifications] best-effort notification "${input.type}" failed to record`);
+    }
+  }
 
   private toResponse(comment: Comment): CommentResponse {
     return {
@@ -42,17 +61,27 @@ export class CommentsService {
     // Must be able to view the post to comment on it — interaction never
     // exceeds visibility (same rule applied consistently across the
     // social-graph module).
-    await this.postAccess.resolveInteractablePost(authorId, postId);
+    const post = await this.postAccess.resolveInteractablePost(authorId, postId);
+    let parentAuthorId: string | null = null;
 
     if (dto.parentCommentId) {
       const parent = await this.prisma.comment.findUnique({ where: { id: dto.parentCommentId } });
       if (!parent || parent.deletedAt || parent.postId !== postId) {
         throw new ResourceNotFoundException();
       }
+      parentAuthorId = parent.authorId;
     }
 
     const comment = await this.prisma.comment.create({
       data: { postId, authorId, body: dto.body, parentCommentId: dto.parentCommentId, status: 'published' },
+    });
+    await this.recordBestEffortNotification({
+      type: dto.parentCommentId ? 'comment_reply' : 'post_comment',
+      recipientUserId: parentAuthorId ?? post.authorId,
+      actorUserId: authorId,
+      targetType: dto.parentCommentId ? 'comment' : 'post',
+      targetId: dto.parentCommentId ?? postId,
+      dedupKey: dto.parentCommentId ? `comment_reply:${comment.id}` : `post_comment:${comment.id}`,
     });
     return this.toResponse(comment);
   }

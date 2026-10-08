@@ -6,6 +6,7 @@ import { MembershipsService } from './memberships.service';
 import { CommunityAccessService } from './community-access.service';
 import { CommunityModerationService } from './community-moderation.service';
 import { ProfilesModule } from '../profiles/profiles.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
@@ -14,6 +15,7 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
   imports: [
     // Reuses ProfileVisibilityService for the block rule, not a re-declared copy.
     ProfilesModule,
+    NotificationsModule,
     JwtModule.register({
       secret: process.env.JWT_ACCESS_SECRET,
     }),

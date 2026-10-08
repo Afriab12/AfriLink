@@ -12,6 +12,7 @@ import { PostAccessService } from './post-access.service';
 import { ContentModerationService } from './content-moderation.service';
 import { ProfilesModule } from '../profiles/profiles.module';
 import { CommunitiesModule } from '../communities/communities.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
@@ -21,6 +22,7 @@ import { CsrfGuard } from '../common/guards/csrf.guard';
     // Reuses ProfileVisibilityService — same instance/rule as profiles
     // and social-graph, not a re-declared copy.
     ProfilesModule,
+    NotificationsModule,
     // CommunityAccessService: the membership rules for posting in a community
     // and for the community audience of its posts.
     CommunitiesModule,

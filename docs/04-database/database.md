@@ -380,15 +380,16 @@ Store user, category, channel, enabled state, locale, quiet-hour configuration, 
 
 **Implementation status (2026-09-19, migration `20260919000000_add_notifications`):** `notifications` and `preferences` are implemented; **`notification.deliveries` is deferred** — it exists for push/email/SMS provider attempts, and those channels are still an open decision. Where the implementation differs from or interprets the design above:
 
-- `type`, `category` and `channel` are **app-validated text**: no approved document enumerates notification types or categories.
+- `type`, `category` and `channel` remain **plain text** in the schema. The approved in-app producer types are `follow_received`, `friend_request_received`, `friend_request_accepted`, `post_reaction`, `comment_reaction`, `post_comment`, `comment_reply` and `community_membership_approved`; no Prisma enum or category/channel vocabulary is introduced.
 - `target_type` / `target_id` are a polymorphic reference with **no foreign key**, and must be both set or both null (CHECK). `actor_user_id` is nullable (system notifications) and `ON DELETE SET NULL`; `recipient_user_id` is `ON DELETE CASCADE`. A CHECK prevents notifying a user of their own action.
 - The "deduplication key" is `dedup_key`, unique per recipient `(recipient_user_id, dedup_key)`; NULLs never collide, and soft-deleted rows still count so a replayed event cannot resurrect a dismissed notification.
 - `preferences` has a composite primary key `(user_id, category, channel)`. `enabled` has **no default** so a channel that needs consent is never implicitly on. `locale` and the quiet-hour columns are nullable per-row overrides; NULL means inherit from `social.user_preferences` / `identity.users`, so there is no second authoritative copy.
 - Indexes: the list index above, a partial unread index (`WHERE read_at IS NULL AND deleted_at IS NULL`), and an index on `deleted_at`.
 - **Retention is an open decision.** No notification retention period has been decided; the schema supplies only lifecycle hooks (`created_at`, `read_at`, `deleted_at`).
 - **The REST API over these tables is implemented** (`api.md` §15, no schema change): list, unread count, mark read and dismiss over `notification.notifications`, using only the columns and indexes above. Read state is `read_at`; dismissal is a soft delete through `deleted_at`, and a dismissed row keeps its `dedup_key`. The API's list, unread-list and unread-count queries were checked with `EXPLAIN (ANALYZE)` on about 600,000 rows: they use the list index and the partial unread index, with no sequential scan, so no index change was needed.
-- **Still not built:** anything that *creates* notifications (there are no producers yet, so the API is exercised with seeded rows; see `docs/08-testing/testing.md`), and any API over `notification.preferences`.
-- **Still deferred, unchanged:** `notification.deliveries` (push/email/SMS provider attempts); an enumerated notification type/category vocabulary (`type`, `category` and `channel` remain app-validated text); and the **retention period** (an open decision: nothing purges or expires notification rows).
+- **Producer status:** A1 records follow and friend-request events; A2 records post/comment reactions, comments/replies and community membership approval. Producers use the existing columns and recipient-scoped deduplication; no schema change was needed. Share and community-role notifications remain deferred.
+- **Still not built:** any API over `notification.preferences`.
+- **Still deferred, unchanged:** `notification.deliveries` (push/email/SMS provider attempts); a category/channel vocabulary (`category` and `channel` remain plain text); and the **retention period** (an open decision: nothing purges or expires notification rows).
 
 ## 11. Media schema
 

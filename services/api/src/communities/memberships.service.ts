@@ -11,6 +11,7 @@ import {
 } from '../common/errors/api-exception';
 import { clampLimit, decodeCursor, toPage } from '../common/pagination/cursor';
 import type { ListMembersQueryDto } from './dto/list-members-query.dto';
+import { NotificationsService, type RecordNotificationInput } from '../notifications/notifications.service';
 
 export interface MembershipStateResponse {
   communityId: string;
@@ -43,7 +44,23 @@ export class MembershipsService {
     private readonly prisma: PrismaService,
     private readonly access: CommunityAccessService,
     private readonly visibility: ProfileVisibilityService,
+    private readonly notifications: NotificationsService,
   ) {}
+
+  private async recordBestEffortNotification(input: RecordNotificationInput): Promise<void> {
+    try {
+      if (
+        input.actorUserId !== null &&
+        input.actorUserId !== input.recipientUserId &&
+        (await this.visibility.isBlocked(input.actorUserId, input.recipientUserId))
+      ) {
+        return;
+      }
+      await this.notifications.record(input);
+    } catch {
+      console.warn(`[notifications] best-effort notification "${input.type}" failed to record`);
+    }
+  }
 
   // Nothing in the schema stops two pending rows for one (community, user)
   // (the unique index covers active rows only), and a check-then-insert
@@ -141,7 +158,7 @@ export class MembershipsService {
   async approve(actorId: string, communityId: string, targetUserId: string) {
     const community = await this.access.findActiveById(communityId);
     await this.requireStaff(community, actorId);
-    return this.serialised(communityId, targetUserId, async (tx) => {
+    const result = await this.serialised(communityId, targetUserId, async (tx) => {
       const rows = await this.rowsFor(tx, communityId, targetUserId);
       const pending = rows.find((r) => r.status === 'pending');
       if (pending) {
@@ -149,14 +166,31 @@ export class MembershipsService {
           where: { id: pending.id },
           data: { status: 'active', approvedAt: new Date(), approvedBy: actorId },
         });
-        return { communityId, userId: targetUserId, status: 'active', role: row.role };
+        return {
+          response: { communityId, userId: targetUserId, status: 'active', role: row.role },
+          membershipId: row.id,
+        };
       }
       const active = rows.find((r) => r.status === 'active');
       if (active) {
-        return { communityId, userId: targetUserId, status: 'active', role: active.role };
+        return {
+          response: { communityId, userId: targetUserId, status: 'active', role: active.role },
+          membershipId: null,
+        };
       }
       throw new ResourceNotFoundException();
     });
+    if (result.membershipId) {
+      await this.recordBestEffortNotification({
+        type: 'community_membership_approved',
+        recipientUserId: targetUserId,
+        actorUserId: actorId,
+        targetType: 'community',
+        targetId: communityId,
+        dedupKey: `community_membership_approved:${result.membershipId}`,
+      });
+    }
+    return result.response;
   }
 
   async reject(actorId: string, communityId: string, targetUserId: string) {

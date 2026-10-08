@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { NotificationsService } from '../src/notifications/notifications.service';
 
 function extractCookies(res: request.Response): Record<string, string> {
   const setCookie = res.headers['set-cookie'];
@@ -69,6 +70,10 @@ describe('Content (e2e)', () => {
       .send({ body: 'Hello AfriLink', ...overrides })
       .expect(201);
     return res.body.data as { id: string; visibility: string };
+  }
+
+  async function notificationsFor(type: string, recipientUserId: string) {
+    return prisma.notification.findMany({ where: { type, recipientUserId } });
   }
 
   // ============================================================
@@ -459,6 +464,329 @@ describe('Content (e2e)', () => {
       expect(res.body.data.comment).toBe('everyone should see this');
     });
 
+    // ============================================================
+    // Notifications A2 — content producers
+    // ============================================================
+
+    describe('Notifications A2: reactions', () => {
+      it('notifies the post author once per reacting actor/target pair across changes, removal and re-reaction', async () => {
+        const author = await registerUser();
+        const reactor = await registerUser();
+        const post = await createPost(author);
+
+        await request(app.getHttpServer()).put(`/api/v1/posts/${post.id}/reaction`).set(auth(reactor)).send({ type: 'like' }).expect(200);
+        const first = await notificationsFor('post_reaction', author.userId);
+        expect(first).toHaveLength(1);
+        expect(first[0]).toMatchObject({
+          actorUserId: reactor.userId,
+          targetType: 'post',
+          targetId: post.id,
+          groupKey: null,
+          dedupKey: `post_reaction:${post.id}:${reactor.userId}`,
+          payload: null,
+        });
+
+        await request(app.getHttpServer()).put(`/api/v1/posts/${post.id}/reaction`).set(auth(reactor)).send({ type: 'love' }).expect(200);
+        await request(app.getHttpServer()).delete(`/api/v1/posts/${post.id}/reaction`).set(auth(reactor)).expect(200);
+        await request(app.getHttpServer()).put(`/api/v1/posts/${post.id}/reaction`).set(auth(reactor)).send({ type: 'support' }).expect(200);
+        expect(await notificationsFor('post_reaction', author.userId)).toHaveLength(1);
+      });
+
+      it('does not notify on a self-reaction', async () => {
+        const author = await registerUser();
+        const post = await createPost(author);
+
+        await request(app.getHttpServer()).put(`/api/v1/posts/${post.id}/reaction`).set(auth(author)).send({ type: 'like' }).expect(200);
+        expect(await notificationsFor('post_reaction', author.userId)).toHaveLength(0);
+      });
+
+      it('keeps the reaction successful when notification recording fails', async () => {
+        const author = await registerUser();
+        const reactor = await registerUser();
+        const post = await createPost(author);
+        const notifications = app.get(NotificationsService);
+        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+
+        await request(app.getHttpServer()).put(`/api/v1/posts/${post.id}/reaction`).set(auth(reactor)).send({ type: 'like' }).expect(200);
+        spy.mockRestore();
+        expect(await prisma.postReaction.findUnique({ where: { userId_postId: { userId: reactor.userId, postId: post.id } } })).not.toBeNull();
+      });
+
+      it('notifies the comment author, uses the comment target and suppresses blocked pairs', async () => {
+        const postAuthor = await registerUser();
+        const commentAuthor = await registerUser();
+        const reactor = await registerUser();
+        const post = await createPost(postAuthor);
+        const comment = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commentAuthor))
+          .send({ body: 'comment target' })
+          .expect(201);
+        const commentId = comment.body.data.id as string;
+
+        await request(app.getHttpServer()).put(`/api/v1/comments/${commentId}/reaction`).set(auth(reactor)).send({ type: 'like' }).expect(200);
+        await request(app.getHttpServer()).put(`/api/v1/comments/${commentId}/reaction`).set(auth(reactor)).send({ type: 'love' }).expect(200);
+        await request(app.getHttpServer()).delete(`/api/v1/comments/${commentId}/reaction`).set(auth(reactor)).expect(200);
+        await request(app.getHttpServer()).put(`/api/v1/comments/${commentId}/reaction`).set(auth(reactor)).send({ type: 'support' }).expect(200);
+        const events = await notificationsFor('comment_reaction', commentAuthor.userId);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+          actorUserId: reactor.userId,
+          targetType: 'comment',
+          targetId: commentId,
+          groupKey: null,
+          dedupKey: `comment_reaction:${commentId}:${reactor.userId}`,
+          payload: null,
+        });
+      });
+
+      it.each([
+        ['recipient blocks actor', 'recipient'],
+        ['actor blocks recipient', 'actor'],
+      ])('suppresses comment-reaction notifications when the pair is blocked (%s)', async (_label, blocker) => {
+        const postAuthor = await registerUser();
+        const commentAuthor = await registerUser();
+        const reactor = await registerUser();
+        const post = await createPost(postAuthor);
+        const comment = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commentAuthor))
+          .send({ body: 'comment target' })
+          .expect(201);
+        const commentId = comment.body.data.id as string;
+        const blockerUser = blocker === 'recipient' ? commentAuthor : reactor;
+        const blockedUser = blocker === 'recipient' ? reactor : commentAuthor;
+
+        await request(app.getHttpServer()).post(`/api/v1/users/${blockedUser.userId}/block`).set(auth(blockerUser)).expect(201);
+        await request(app.getHttpServer()).put(`/api/v1/comments/${commentId}/reaction`).set(auth(reactor)).send({ type: 'like' }).expect(200);
+
+        expect(await notificationsFor('comment_reaction', commentAuthor.userId)).toHaveLength(0);
+        expect(await prisma.commentReaction.findUnique({ where: { userId_commentId: { userId: reactor.userId, commentId } } })).not.toBeNull();
+      });
+
+      it('does not notify on a self-reaction to a comment', async () => {
+        const postAuthor = await registerUser();
+        const commentAuthor = await registerUser();
+        const post = await createPost(postAuthor);
+        const comment = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commentAuthor))
+          .send({ body: 'own comment' })
+          .expect(201);
+
+        await request(app.getHttpServer())
+          .put(`/api/v1/comments/${comment.body.data.id}/reaction`)
+          .set(auth(commentAuthor))
+          .send({ type: 'like' })
+          .expect(200);
+        expect(await notificationsFor('comment_reaction', commentAuthor.userId)).toHaveLength(0);
+      });
+
+      it('keeps the comment reaction successful when notification recording fails', async () => {
+        const postAuthor = await registerUser();
+        const commentAuthor = await registerUser();
+        const reactor = await registerUser();
+        const post = await createPost(postAuthor);
+        const comment = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commentAuthor))
+          .send({ body: 'comment target' })
+          .expect(201);
+        const commentId = comment.body.data.id as string;
+        const notifications = app.get(NotificationsService);
+        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+
+        await request(app.getHttpServer()).put(`/api/v1/comments/${commentId}/reaction`).set(auth(reactor)).send({ type: 'like' }).expect(200);
+        spy.mockRestore();
+        expect(await prisma.commentReaction.findUnique({ where: { userId_commentId: { userId: reactor.userId, commentId } } })).not.toBeNull();
+      });
+    });
+
+    describe('Notifications A2: comments and replies', () => {
+      it('notifies the post author for a top-level comment without storing its body', async () => {
+        const postAuthor = await registerUser();
+        const commenter = await registerUser();
+        const post = await createPost(postAuthor);
+        const comment = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commenter))
+          .send({ body: 'private comment content' })
+          .expect(201);
+        const commentId = comment.body.data.id as string;
+
+        const events = await notificationsFor('post_comment', postAuthor.userId);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+          actorUserId: commenter.userId,
+          targetType: 'post',
+          targetId: post.id,
+          groupKey: null,
+          dedupKey: `post_comment:${commentId}`,
+          payload: null,
+        });
+        expect(JSON.stringify(events[0])).not.toContain('private comment content');
+      });
+
+      it('creates a distinct notification for each separately-created top-level comment', async () => {
+        const postAuthor = await registerUser();
+        const commenter = await registerUser();
+        const post = await createPost(postAuthor);
+
+        const first = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commenter))
+          .send({ body: 'first comment' })
+          .expect(201);
+        const second = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commenter))
+          .send({ body: 'second comment' })
+          .expect(201);
+
+        const events = await notificationsFor('post_comment', postAuthor.userId);
+        expect(events).toHaveLength(2);
+        expect(events.map((event) => event.dedupKey).sort()).toEqual(
+          [`post_comment:${first.body.data.id}`, `post_comment:${second.body.data.id}`].sort(),
+        );
+      });
+
+      it('does not notify for a self-comment or a self-reply', async () => {
+        const author = await registerUser();
+        const post = await createPost(author);
+        const ownComment = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(author))
+          .send({ body: 'self comment' })
+          .expect(201);
+        const anotherCommenter = await registerUser();
+        const parent = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(anotherCommenter))
+          .send({ body: 'parent' })
+          .expect(201);
+
+        await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(anotherCommenter))
+          .send({ body: 'self reply', parentCommentId: parent.body.data.id })
+          .expect(201);
+
+        expect(await notificationsFor('post_comment', author.userId)).toHaveLength(1);
+        expect((await notificationsFor('post_comment', author.userId))[0].targetId).toBe(post.id);
+        expect(await notificationsFor('comment_reply', anotherCommenter.userId)).toHaveLength(0);
+        expect(ownComment.body.data.authorId).toBe(author.userId);
+      });
+
+      it('notifies only the direct parent author for replies at each nesting level', async () => {
+        const postAuthor = await registerUser();
+        const rootAuthor = await registerUser();
+        const firstReplier = await registerUser();
+        const secondReplier = await registerUser();
+        const post = await createPost(postAuthor);
+        const root = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(rootAuthor))
+          .send({ body: 'root' })
+          .expect(201);
+        const firstReply = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(firstReplier))
+          .send({ body: 'reply body must not be stored', parentCommentId: root.body.data.id })
+          .expect(201);
+        const secondReply = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(secondReplier))
+          .send({ body: 'nested reply', parentCommentId: firstReply.body.data.id })
+          .expect(201);
+
+        const rootEvent = (await notificationsFor('comment_reply', rootAuthor.userId))[0];
+        expect(rootEvent).toMatchObject({
+          actorUserId: firstReplier.userId,
+          targetType: 'comment',
+          targetId: root.body.data.id,
+          dedupKey: `comment_reply:${firstReply.body.data.id}`,
+          groupKey: null,
+          payload: null,
+        });
+        const nestedEvent = (await notificationsFor('comment_reply', firstReplier.userId))[0];
+        expect(nestedEvent).toMatchObject({
+          actorUserId: secondReplier.userId,
+          targetType: 'comment',
+          targetId: firstReply.body.data.id,
+          dedupKey: `comment_reply:${secondReply.body.data.id}`,
+          payload: null,
+        });
+        expect(await notificationsFor('comment_reply', postAuthor.userId)).toHaveLength(0);
+        expect(await notificationsFor('comment_reply', rootAuthor.userId)).toHaveLength(1);
+        expect(JSON.stringify(rootEvent)).not.toContain('reply body must not be stored');
+      });
+
+      it.each([
+        ['recipient blocks actor', 'recipient'],
+        ['actor blocks recipient', 'actor'],
+      ])('suppresses reply notifications when the pair is blocked (%s)', async (_label, blocker) => {
+        const postAuthor = await registerUser();
+        const parentAuthor = await registerUser();
+        const replier = await registerUser();
+        const post = await createPost(postAuthor);
+        const parent = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(parentAuthor))
+          .send({ body: 'parent' })
+          .expect(201);
+        const blockerUser = blocker === 'recipient' ? parentAuthor : replier;
+        const blockedUser = blocker === 'recipient' ? replier : parentAuthor;
+
+        await request(app.getHttpServer()).post(`/api/v1/users/${blockedUser.userId}/block`).set(auth(blockerUser)).expect(201);
+        const reply = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(replier))
+          .send({ body: 'reply', parentCommentId: parent.body.data.id })
+          .expect(201);
+
+        expect(await notificationsFor('comment_reply', parentAuthor.userId)).toHaveLength(0);
+        expect(await prisma.comment.findUnique({ where: { id: reply.body.data.id } })).not.toBeNull();
+      });
+
+      it('keeps comment creation successful when notification recording fails', async () => {
+        const postAuthor = await registerUser();
+        const commenter = await registerUser();
+        const post = await createPost(postAuthor);
+        const notifications = app.get(NotificationsService);
+        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+
+        const comment = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(commenter))
+          .send({ body: 'still created' })
+          .expect(201);
+        spy.mockRestore();
+        expect(await prisma.comment.findUnique({ where: { id: comment.body.data.id } })).not.toBeNull();
+      });
+
+      it('keeps reply creation successful when notification recording fails', async () => {
+        const postAuthor = await registerUser();
+        const parentAuthor = await registerUser();
+        const replier = await registerUser();
+        const post = await createPost(postAuthor);
+        const parent = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(parentAuthor))
+          .send({ body: 'parent' })
+          .expect(201);
+        const notifications = app.get(NotificationsService);
+        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
+
+        const reply = await request(app.getHttpServer())
+          .post(`/api/v1/posts/${post.id}/comments`)
+          .set(auth(replier))
+          .send({ body: 'still created', parentCommentId: parent.body.data.id })
+          .expect(201);
+        spy.mockRestore();
+        expect(await prisma.comment.findUnique({ where: { id: reply.body.data.id } })).not.toBeNull();
+      });
+    });
+
     it('allows sharing the same post more than once — no uniqueness constraint in the approved schema', async () => {
       const author = await registerUser();
       const sharer = await registerUser();
@@ -674,6 +1002,7 @@ describe('Content (e2e)', () => {
         .send({ type: 'like' })
         .expect(404);
       await request(app.getHttpServer()).post(`/api/v1/posts/${post.id}/shares`).set(auth(blocked)).send({}).expect(404);
+      expect(await notificationsFor('post_reaction', author.userId)).toHaveLength(0);
     });
   });
 });
