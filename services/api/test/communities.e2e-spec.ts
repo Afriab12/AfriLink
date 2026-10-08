@@ -7,7 +7,6 @@ import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
 import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 import { PrismaService } from '../src/common/prisma/prisma.service';
-import { NotificationsService } from '../src/notifications/notifications.service';
 
 function extractCookies(res: request.Response): Record<string, string> {
   const setCookie = res.headers['set-cookie'];
@@ -838,13 +837,18 @@ describe('Communities (e2e)', () => {
       expect(await approvalNotifications(requester.userId)).toHaveLength(1);
     });
 
-    it('keeps membership approval successful when notification recording fails', async () => {
+    it('keeps membership approval successful when preference lookup fails', async () => {
       const { owner, c, requester } = await pendingRequest();
-      const notifications = app.get(NotificationsService);
-      const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
-
-      await post(owner, `/communities/${c.id}/members/${requester.userId}/approve`).expect(200);
-      spy.mockRestore();
+      const lookup = vi
+        .spyOn(prisma.notificationPreference, 'findUnique')
+        .mockRejectedValueOnce(new Error('simulated preference lookup failure'));
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        await post(owner, `/communities/${c.id}/members/${requester.userId}/approve`).expect(200);
+      } finally {
+        lookup.mockRestore();
+        warning.mockRestore();
+      }
       expect((await rows(c.id, requester.userId))[0]).toMatchObject({ status: 'active', approvedBy: owner.userId });
       expect(await approvalNotifications(requester.userId)).toHaveLength(0);
     });

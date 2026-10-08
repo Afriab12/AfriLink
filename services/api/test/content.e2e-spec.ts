@@ -500,16 +500,26 @@ describe('Content (e2e)', () => {
         expect(await notificationsFor('post_reaction', author.userId)).toHaveLength(0);
       });
 
-      it('keeps the reaction successful when notification recording fails', async () => {
+      it('keeps the reaction successful when preference lookup fails', async () => {
         const author = await registerUser();
         const reactor = await registerUser();
         const post = await createPost(author);
-        const notifications = app.get(NotificationsService);
-        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
-
-        await request(app.getHttpServer()).put(`/api/v1/posts/${post.id}/reaction`).set(auth(reactor)).send({ type: 'like' }).expect(200);
-        spy.mockRestore();
+        const lookup = vi
+          .spyOn(prisma.notificationPreference, 'findUnique')
+          .mockRejectedValueOnce(new Error('simulated preference lookup failure'));
+        const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        try {
+          await request(app.getHttpServer())
+            .put(`/api/v1/posts/${post.id}/reaction`)
+            .set(auth(reactor))
+            .send({ type: 'like' })
+            .expect(200);
+        } finally {
+          lookup.mockRestore();
+          warning.mockRestore();
+        }
         expect(await prisma.postReaction.findUnique({ where: { userId_postId: { userId: reactor.userId, postId: post.id } } })).not.toBeNull();
+        expect(await notificationsFor('post_reaction', author.userId)).toHaveLength(0);
       });
 
       it('notifies the comment author, uses the comment target and suppresses blocked pairs', async () => {

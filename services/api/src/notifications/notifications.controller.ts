@@ -1,8 +1,9 @@
-import { Controller, Delete, Get, Header, HttpCode, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Header, HttpCode, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { NotificationsService, type NotificationResponse } from './notifications.service';
 import { ListNotificationsQueryDto } from './dto/list-notifications-query.dto';
 import { NotificationIdParamDto } from './dto/notification-id-param.dto';
+import { UpdateNotificationPreferencesDto } from './dto/update-notification-preferences.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CsrfGuard } from '../common/guards/csrf.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -42,6 +43,23 @@ export class NotificationsController {
   @Header('Cache-Control', 'private, no-store')
   async unreadCount(@CurrentUser() user: { sub: string }): Promise<{ data: { count: number; capped: boolean } }> {
     return { data: await this.notificationsService.unreadCount(user.sub) };
+  }
+
+  @Get('preferences')
+  @Header('Cache-Control', 'private, no-store')
+  async preferences(@CurrentUser() user: { sub: string }) {
+    return { data: { preferences: await this.notificationsService.getPreferences(user.sub) } };
+  }
+
+  @Patch('preferences')
+  @UseGuards(CsrfGuard)
+  async updatePreferences(
+    @CurrentUser() user: { sub: string },
+    @Body() body: UpdateNotificationPreferencesDto,
+  ) {
+    return {
+      data: { preferences: await this.notificationsService.updatePreferences(user.sub, body.preferences) },
+    };
   }
 
   // 204, not the 200 + body other mutation routes use: approved for the

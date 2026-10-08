@@ -8,6 +8,7 @@ import type { Prisma } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { HttpExceptionFilter } from '../src/common/filters/http-exception.filter';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { NotificationsService } from '../src/notifications/notifications.service';
 
 function extractCookies(res: request.Response): Record<string, string> {
   const setCookie = res.headers['set-cookie'];
@@ -34,12 +35,12 @@ function uniqueEmail(): string {
 
 type TestUser = { userId: string; cookies: Record<string, string> };
 
-// The Notifications API has no producers yet, so every test seeds rows
-// directly (approved). `type` is an opaque string: no notification type
-// vocabulary exists to close over.
+// Notification reads are seeded directly; producer flows are exercised in
+// their owning module suites, with A3 policy mapping covered here via record().
 describe('Notifications (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
+  let notificationsService: NotificationsService;
   let seq = 0;
 
   beforeAll(async () => {
@@ -51,6 +52,7 @@ describe('Notifications (e2e)', () => {
     app.useGlobalFilters(new HttpExceptionFilter());
     await app.init();
     prisma = app.get(PrismaService);
+    notificationsService = app.get(NotificationsService);
   });
 
   afterAll(async () => {
@@ -143,6 +145,261 @@ describe('Notifications (e2e)', () => {
     }
     throw new Error('pagination did not terminate');
   }
+
+  // ============================================================
+  // GET/PATCH /notifications/preferences
+  // ============================================================
+
+  describe('notification preferences', () => {
+    it('returns the authenticated user effective matrix with enabled defaults', async () => {
+      const user = await registerUser();
+      const response = await request(app.getHttpServer())
+        .get('/api/v1/notifications/preferences')
+        .set(auth(user))
+        .expect(200);
+
+      expect(response.headers['cache-control']).toBe('private, no-store');
+      expect(response.body).toEqual({
+        data: {
+          preferences: [
+            { category: 'social', channel: 'in_app', enabled: true },
+            { category: 'engagement', channel: 'in_app', enabled: true },
+            { category: 'community', channel: 'in_app', enabled: true },
+          ],
+        },
+      });
+      await request(app.getHttpServer()).get('/api/v1/notifications/preferences').expect(401);
+    });
+
+    it('returns persisted preference overrides from GET after disabling and re-enabling a category', async () => {
+      const user = await registerUser();
+      const getPreferences = () =>
+        request(app.getHttpServer()).get('/api/v1/notifications/preferences').set(auth(user));
+      const updatePreference = (enabled: boolean) =>
+        request(app.getHttpServer())
+          .patch('/api/v1/notifications/preferences')
+          .set(auth(user))
+          .send({ preferences: [{ category: 'engagement', channel: 'in_app', enabled }] });
+
+      const initial = await getPreferences().expect(200);
+      expect(
+        initial.body.data.preferences.find(
+          (preference: { category: string; channel: string }) =>
+            preference.category === 'engagement' && preference.channel === 'in_app',
+        ).enabled,
+      ).toBe(true);
+
+      await updatePreference(false).expect(200);
+      const disabled = await getPreferences().expect(200);
+      expect(
+        disabled.body.data.preferences.find(
+          (preference: { category: string; channel: string }) =>
+            preference.category === 'engagement' && preference.channel === 'in_app',
+        ).enabled,
+      ).toBe(false);
+
+      await updatePreference(true).expect(200);
+      const reenabled = await getPreferences().expect(200);
+      expect(
+        reenabled.body.data.preferences.find(
+          (preference: { category: string; channel: string }) =>
+            preference.category === 'engagement' && preference.channel === 'in_app',
+        ).enabled,
+      ).toBe(true);
+    });
+
+    it('updates only supplied tuples and keeps preferences scoped to the authenticated user', async () => {
+      const user = await registerUser();
+      const other = await registerUser();
+
+      const response = await request(app.getHttpServer())
+        .patch('/api/v1/notifications/preferences')
+        .set(auth(user))
+        .send({ preferences: [{ category: 'engagement', channel: 'in_app', enabled: false }] })
+        .expect(200);
+      expect(response.body.data.preferences).toEqual([
+        { category: 'social', channel: 'in_app', enabled: true },
+        { category: 'engagement', channel: 'in_app', enabled: false },
+        { category: 'community', channel: 'in_app', enabled: true },
+      ]);
+      expect(await prisma.notificationPreference.findMany({ where: { userId: other.userId } })).toHaveLength(0);
+    });
+
+    it('requires CSRF for updates', async () => {
+      const user = await registerUser();
+      await request(app.getHttpServer())
+        .patch('/api/v1/notifications/preferences')
+        .set('Cookie', cookieHeader(user.cookies, 'afrilink_at', 'afrilink_csrf'))
+        .send({ preferences: [{ category: 'social', channel: 'in_app', enabled: false }] })
+        .expect(403);
+    });
+
+    it.each([
+      ['duplicate category/channel tuples', { preferences: [
+        { category: 'social', channel: 'in_app', enabled: false },
+        { category: 'social', channel: 'in_app', enabled: true },
+      ] }],
+      ['unknown categories', { preferences: [{ category: 'moderation', channel: 'in_app', enabled: false }] }],
+      ['unknown channels', { preferences: [{ category: 'social', channel: 'push', enabled: false }] }],
+      ['non-boolean enabled values', { preferences: [{ category: 'social', channel: 'in_app', enabled: 'false' }] }],
+      [
+        'unknown fields and non-object preference entries',
+        {
+          preferences: [
+            { category: 'social', channel: 'in_app', enabled: false, userId: randomUUID() },
+            null,
+          ],
+        },
+      ],
+      ['caller-supplied user IDs', { userId: randomUUID(), preferences: [] }],
+    ])('rejects %s', async (_description, body) => {
+      const user = await registerUser();
+      const response = await request(app.getHttpServer())
+        .patch('/api/v1/notifications/preferences')
+        .set(auth(user))
+        .send(body)
+        .expect(422);
+      expect(response.body.error.code).toBe('VALIDATION_FAILED');
+    });
+
+    it('enforces category defaults, overrides, prospective changes, and unconsumed dedup keys', async () => {
+      const recipient = await registerUser();
+      const actor = await registerUser();
+      const notificationTypes = [
+        'friend_request_received',
+        'friend_request_accepted',
+        'follow_received',
+        'post_reaction',
+        'comment_reaction',
+        'post_comment',
+        'comment_reply',
+        'community_membership_approved',
+      ];
+      const categoryForType: Record<string, 'social' | 'engagement' | 'community'> = {
+        friend_request_received: 'social',
+        friend_request_accepted: 'social',
+        follow_received: 'social',
+        post_reaction: 'engagement',
+        comment_reaction: 'engagement',
+        post_comment: 'engagement',
+        comment_reply: 'engagement',
+        community_membership_approved: 'community',
+      };
+      const record = (type: string, suffix: string) =>
+        notificationsService.record({
+          type,
+          recipientUserId: recipient.userId,
+          actorUserId: actor.userId,
+          dedupKey: `${type}:${suffix}`,
+        });
+
+      for (const type of notificationTypes) {
+        await record(type, 'defaults');
+      }
+      const beforeDisable = await prisma.notification.findMany({
+        where: { recipientUserId: recipient.userId },
+        orderBy: { type: 'asc' },
+        select: { id: true, type: true, dedupKey: true, readAt: true, deletedAt: true },
+      });
+      expect(beforeDisable).toHaveLength(notificationTypes.length);
+
+      for (const category of ['social', 'engagement', 'community'] as const) {
+        await request(app.getHttpServer())
+          .patch('/api/v1/notifications/preferences')
+          .set(auth(recipient))
+          .send({ preferences: [{ category, channel: 'in_app', enabled: false }] })
+          .expect(200);
+        for (const type of notificationTypes) {
+          await record(type, `disabled:${category}`);
+        }
+
+        const categoryAttempts = await prisma.notification.findMany({
+          where: {
+            recipientUserId: recipient.userId,
+            dedupKey: { endsWith: `disabled:${category}` },
+          },
+          select: { type: true },
+        });
+        expect(categoryAttempts.map((row) => row.type).sort()).toEqual(
+          notificationTypes.filter((type) => categoryForType[type] !== category).sort(),
+        );
+
+        await request(app.getHttpServer())
+          .patch('/api/v1/notifications/preferences')
+          .set(auth(recipient))
+          .send({ preferences: [{ category, channel: 'in_app', enabled: true }] })
+          .expect(200);
+      }
+      expect(
+        await prisma.notification.findMany({
+          where: { recipientUserId: recipient.userId, id: { in: beforeDisable.map((row) => row.id) } },
+          orderBy: { type: 'asc' },
+          select: { id: true, type: true, dedupKey: true, readAt: true, deletedAt: true },
+        }),
+      ).toEqual(beforeDisable);
+
+      const deferredDedupKey = 'post_reaction:disabled-then-enabled';
+      await request(app.getHttpServer())
+        .patch('/api/v1/notifications/preferences')
+        .set(auth(recipient))
+        .send({ preferences: [{ category: 'engagement', channel: 'in_app', enabled: false }] })
+        .expect(200);
+      await notificationsService.record({
+        type: 'post_reaction',
+        recipientUserId: recipient.userId,
+        actorUserId: actor.userId,
+        dedupKey: deferredDedupKey,
+      });
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/notifications/preferences')
+        .set(auth(recipient))
+        .send({ preferences: [{ category: 'engagement', channel: 'in_app', enabled: true }] })
+        .expect(200);
+      for (const type of notificationTypes) {
+        await record(type, 'reenabled');
+      }
+      await notificationsService.record({
+        type: 'post_reaction',
+        recipientUserId: recipient.userId,
+        actorUserId: actor.userId,
+        dedupKey: deferredDedupKey,
+      });
+
+      const finalRows = await prisma.notification.findMany({
+        where: { recipientUserId: recipient.userId },
+        select: { type: true, dedupKey: true },
+      });
+      expect(finalRows).toHaveLength(
+        notificationTypes.length + notificationTypes.filter((type) => categoryForType[type] !== 'social').length +
+          notificationTypes.filter((type) => categoryForType[type] !== 'engagement').length +
+          notificationTypes.filter((type) => categoryForType[type] !== 'community').length +
+          notificationTypes.length +
+          1,
+      );
+      expect(finalRows.some((row) => row.dedupKey === deferredDedupKey)).toBe(true);
+      expect(Object.keys(categoryForType)).toEqual(notificationTypes);
+    });
+
+    it('fails closed when preference lookup fails without creating a notification', async () => {
+      const recipient = await registerUser();
+      const actor = await registerUser();
+      const lookup = vi
+        .spyOn(prisma.notificationPreference, 'findUnique')
+        .mockRejectedValueOnce(new Error('simulated preference lookup failure'));
+
+      await expect(
+        notificationsService.record({
+          type: 'follow_received',
+          recipientUserId: recipient.userId,
+          actorUserId: actor.userId,
+          dedupKey: 'follow:lookup-failure',
+        }),
+      ).rejects.toThrow('simulated preference lookup failure');
+      expect(await prisma.notification.count({ where: { recipientUserId: recipient.userId } })).toBe(0);
+      lookup.mockRestore();
+    });
+  });
 
   async function block(blocker: TestUser, blocked: TestUser) {
     await request(app.getHttpServer()).post(`/api/v1/users/${blocked.userId}/block`).set(auth(blocker)).expect(201);

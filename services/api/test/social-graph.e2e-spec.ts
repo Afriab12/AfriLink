@@ -475,17 +475,24 @@ describe('Social graph (e2e)', () => {
         expect(follows).toHaveLength(2); // unfollow soft-deletes; re-follow creates a new row, per the actual lifecycle
       });
 
-      it('is best-effort: follow still succeeds (201) even if NotificationsService.record() fails', async () => {
-        const notifications = app.get(NotificationsService);
+      it('is best-effort: follow succeeds when preference lookup fails', async () => {
         const a = await registerUser();
         const b = await registerUser();
 
-        const spy = vi.spyOn(notifications, 'record').mockRejectedValueOnce(new Error('simulated notification failure'));
-        await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
-        spy.mockRestore();
+        const lookup = vi
+          .spyOn(prisma.notificationPreference, 'findUnique')
+          .mockRejectedValueOnce(new Error('simulated preference lookup failure'));
+        const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        try {
+          await request(app.getHttpServer()).post(`/api/v1/users/${b.userId}/follow`).set(auth(a)).expect(201);
+        } finally {
+          lookup.mockRestore();
+          warning.mockRestore();
+        }
 
         const followers = await request(app.getHttpServer()).get(`/api/v1/users/${b.userId}/followers`).expect(200);
         expect(followers.body.data.map((f: { userId: string }) => f.userId)).toContain(a.userId);
+        expect(await prisma.notification.count({ where: { recipientUserId: b.userId, type: 'follow_received' } })).toBe(0);
       });
     });
 

@@ -3,9 +3,30 @@ import { Prisma } from '@prisma/client';
 import type { Notification, UserStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ProfileVisibilityService } from '../profiles/profile-visibility.service';
-import { InvalidCursorException, ResourceNotFoundException } from '../common/errors/api-exception';
+import {
+  InvalidCursorException,
+  ResourceNotFoundException,
+  ValidationFailedException,
+} from '../common/errors/api-exception';
 import { clampLimit, decodeCursor, toPage } from '../common/pagination/cursor';
 import type { ListNotificationsQueryDto } from './dto/list-notifications-query.dto';
+
+export const NOTIFICATION_PREFERENCE_CATEGORIES = ['social', 'engagement', 'community'] as const;
+export const NOTIFICATION_PREFERENCE_CHANNELS = ['in_app'] as const;
+
+export type NotificationPreferenceCategory = (typeof NOTIFICATION_PREFERENCE_CATEGORIES)[number];
+export type NotificationPreferenceChannel = (typeof NOTIFICATION_PREFERENCE_CHANNELS)[number];
+
+const NOTIFICATION_TYPE_CATEGORY = new Map<string, NotificationPreferenceCategory>([
+  ['friend_request_received', 'social'],
+  ['friend_request_accepted', 'social'],
+  ['follow_received', 'social'],
+  ['post_reaction', 'engagement'],
+  ['comment_reaction', 'engagement'],
+  ['post_comment', 'engagement'],
+  ['comment_reply', 'engagement'],
+  ['community_membership_approved', 'community'],
+]);
 
 // The unread badge is capped so the query stays cheap however large a
 // backlog gets: exact up to this many, "this many or more" beyond it.
@@ -28,17 +49,14 @@ export interface NotificationResponse {
   targetId: string | null;
   groupKey: string | null;
   // Returned exactly as stored. It is "safe display metadata only" by
-  // contract (database.md §10) but nothing validates it: there are no
-  // producers and no notification type vocabulary yet.
+  // contract (database.md §10); producers currently leave it null.
   payload: unknown;
   readAt: Date | null;
   createdAt: Date;
 }
 
-// Producer-facing input (Notifications A1). Deliberately a small, generic
-// shape — not a per-type discriminated union like AuditEventInput — since
-// there is no approved type vocabulary to close over yet (database.md
-// §10). `type` stays a free string by design.
+// Producer-facing input (Notifications A1). Keep the producer shape generic;
+// the supported type-to-preference mapping is enforced centrally in record().
 export interface RecordNotificationInput {
   type: string;
   recipientUserId: string;
@@ -70,15 +88,16 @@ export class NotificationsService {
     private readonly visibility: ProfileVisibilityService,
   ) {}
 
-  // Centralized producer entry point (Notifications A1, Option B). Callers
-  // are responsible for atomicity classification themselves (all A1
-  // producers are best-effort — see each producer's own wrapper); this
-  // method is deliberately unopinionated about that.
+  // Centralized producer entry point. Producers remain responsible for
+  // atomicity classification; current producers use best-effort wrappers.
   //
   // Self-notification: defensively no-ops rather than letting the DB CHECK
   // (`notifications_no_self_notify_check`) throw — every current producer
   // already guards against this upstream, so this path is not expected to
   // be reached in practice, but the service does not trust callers alone.
+  //
+  // Preference resolution happens before creation, so a disabled event or
+  // lookup failure never claims its dedup key.
   //
   // Deduplication: `dedupKey` collisions (the unique
   // `(recipientUserId, dedupKey)` index) are treated as an expected,
@@ -88,6 +107,11 @@ export class NotificationsService {
     if (input.actorUserId !== null && input.actorUserId === input.recipientUserId) {
       return;
     }
+    const category = NOTIFICATION_TYPE_CATEGORY.get(input.type);
+    if (!category || !(await this.preferenceEnabled(input.recipientUserId, category, 'in_app'))) {
+      return;
+    }
+
     try {
       await this.prisma.notification.create({
         data: {
@@ -106,6 +130,67 @@ export class NotificationsService {
       }
       throw error;
     }
+  }
+
+  async getPreferences(userId: string): Promise<
+    { category: NotificationPreferenceCategory; channel: NotificationPreferenceChannel; enabled: boolean }[]
+  > {
+    const overrides = await this.prisma.notificationPreference.findMany({
+      where: {
+        userId,
+        category: { in: [...NOTIFICATION_PREFERENCE_CATEGORIES] },
+        channel: 'in_app',
+      },
+      select: { category: true, enabled: true },
+    });
+    const enabledByCategory = new Map(overrides.map((preference) => [preference.category, preference.enabled]));
+
+    return NOTIFICATION_PREFERENCE_CATEGORIES.map((category) => ({
+      category,
+      channel: 'in_app',
+      enabled: enabledByCategory.get(category) ?? true,
+    }));
+  }
+
+  async updatePreferences(
+    userId: string,
+    preferences: {
+      category: NotificationPreferenceCategory;
+      channel: NotificationPreferenceChannel;
+      enabled: boolean;
+    }[],
+  ): Promise<{ category: NotificationPreferenceCategory; channel: NotificationPreferenceChannel; enabled: boolean }[]> {
+    const keys = preferences.map(({ category, channel }) => `${category}:${channel}`);
+    if (new Set(keys).size !== keys.length) {
+      throw new ValidationFailedException([
+        { field: 'preferences', reason: 'must not contain duplicate category/channel pairs' },
+      ]);
+    }
+
+    await this.prisma.$transaction(
+      preferences.map(({ category, channel, enabled }) =>
+        this.prisma.notificationPreference.upsert({
+          where: { userId_category_channel: { userId, category, channel } },
+          create: { userId, category, channel, enabled },
+          update: { enabled },
+        }),
+      ),
+    );
+
+    return this.getPreferences(userId);
+  }
+
+  private async preferenceEnabled(
+    userId: string,
+    category: NotificationPreferenceCategory,
+    channel: NotificationPreferenceChannel,
+  ): Promise<boolean> {
+    const preference = await this.prisma.notificationPreference.findUnique({
+      where: { userId_category_channel: { userId, category, channel } },
+      select: { enabled: true },
+    });
+
+    return preference?.enabled ?? true;
   }
 
   // The rows this recipient may see, as AND-ed conditions (AND, because the
