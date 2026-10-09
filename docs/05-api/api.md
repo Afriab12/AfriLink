@@ -351,7 +351,7 @@ Written for the separate frontend team building against this contract.
 - **Optimistic operations:** safe to optimistically apply follow/reaction/share toggles client-side (server enforces the real state regardless); post/comment creation should wait for the server response before showing as permanent, since content passes validation/policy checks that can reject it.
 - **Idempotency:** attach `Idempotency-Key` (any client-generated UUID) on retryable mutations listed in §12 before retrying a timed-out request — never retry those without one, to avoid duplicate posts/friend-requests/etc.
 - **WebSocket (messaging only):** available now on the `/messaging` namespace. On web, connection auth reuses your existing session cookie automatically — no separate token handling; mobile passes the access token in the Socket.IO handshake `auth` payload.
-- **Notifications (REST polling only, no push channel for the MVP):** poll `GET /notifications/unread-count` for the badge (`count` is exact up to 100; `capped: true` means "100 or more") and `GET /notifications` for the list. `POST /notifications/{id}/read` and `DELETE /notifications/{id}` (dismiss) return `204` with no body and are safe to retry. Both `GET` routes send `Cache-Control: private, no-store`. No rate limit is enforced yet (§11), so pick a polling interval you would be comfortable defending.
+- **Notifications (REST polling only, no push channel for the MVP):** poll `GET /notifications/unread-count` for the badge (`count` is exact up to 100; `capped: true` means "100 or more") and `GET /notifications` for the list. Use `GET/PATCH /notifications/preferences` to read and partially update the caller's in-app category settings. `POST /notifications/{id}/read` and `DELETE /notifications/{id}` (dismiss) return `204` with no body and are safe to retry. All `GET` routes send `Cache-Control: private, no-store`. No rate limit is enforced yet (§11), so pick a polling interval you would be comfortable defending.
 
 ## 15. Phase 2 API contracts (implemented and future)
 
@@ -362,7 +362,7 @@ Communities, Messaging and Notifications now have backing database schemas (Data
 | Feed | REST | `/feed`, `/communities/{id}/feed` | Authenticated; visibility+block+moderation filtering at read time | Cursor (§9 convention) | `feed.entries` and ranking metadata — does not exist | **Future contract only.** Preserves the approved ranking concept (relationship + relevance + recency + basic engagement, `architecture.md` §13) as the design target once buildable. |
 | Communities | REST | `/communities`, memberships, invitations | Scoped community roles, separate from platform roles | Cursor for members/posts | `community.*` — database implemented; no API yet | **Future contract only.** |
 | Messaging | WebSocket (delivery) + REST (writes/history) | `/conversations`, `/conversations/{id}/messages` | Per-conversation participant check | Cursor (§9); WS is not paginated | `messaging.*` — implemented | **Implemented** (§13, ADR-006). |
-| Notifications | REST/polling only (no WS for MVP) | `/notifications` *(implemented)*, `/notification-preferences` *(not built)* | Authenticated, recipient-only | Cursor (§9) | `notification.*` — implemented | **Implemented** for list, unread count, mark read and dismiss (routes below). Preferences endpoints, read-all and notification producers are not built. Transport decision (REST, not WS) is final for MVP per frontend team (§13/ADR-004 §7). |
+| Notifications | REST/polling only (no WS for MVP) | `/notifications` *(implemented)*, `/notifications/preferences` *(implemented)* | Authenticated, recipient-only | Cursor (§9) for notification lists | `notification.*` — implemented | **Implemented** for list, unread count, mark read, dismiss, and in-app preferences (routes below). Read-all remains deferred. Transport decision (REST, not WS) is final for MVP per frontend team (§13/ADR-004 §7). |
 | Media | REST (signed upload flow) | `/media/uploads`, `/media/uploads/{id}/complete`, `/media/{id}` | Owner-authorized | N/A (single-resource reads) | `media.*` — schema implemented and migrated (commit `a546c34`); no API yet | **Future contract only.** Detailed design (all 4 routes, storage boundary, dependency gate, security): `docs/05-api/media.md`. |
 | Moderation | REST | `/reports`, `/moderation/cases`, appeals | User-facing (own reports) vs. scoped moderator/admin | Cursor for queues | `moderation.*` — does not exist | **Future contract only.** |
 | Admin | REST | `/admin/*` | Platform role + MFA + audit | Offset (§9) | `admin.*`, `audit.*` — do not exist | **Future contract only.** |
@@ -370,7 +370,7 @@ Communities, Messaging and Notifications now have backing database schemas (Data
 
 ### Implemented Notifications REST routes
 
-All routes require authentication (JWT). The two state-changing routes also require the CSRF header (§4). Errors follow §6. Every route is **recipient-scoped**: there is no way to name another user's notification, and another user's id is indistinguishable from one that does not exist (`404`).
+All routes require authentication (JWT). Every state-changing route also requires the CSRF header (§4). Errors follow §6. Every route is **recipient-scoped**: there is no way to name another user's notification or preferences, and another user's notification id is indistinguishable from one that does not exist (`404`).
 
 | Method | Path | Behavior |
 |---|---|---|
@@ -378,6 +378,10 @@ All routes require authentication (JWT). The two state-changing routes also requ
 | `GET` | `/notifications/unread-count` | `{ "data": { "count", "capped" } }`: the number of unread, non-dismissed, non-blocked notifications, **exact up to 100**; if there are more than 100, `count` is `100` and `capped` is `true` (read it as "100 or more"). Uses exactly the same filters as the list, so the badge cannot disagree with it. |
 | `POST` | `/notifications/{id}/read` | Marks one notification read. `204`, no body. **Idempotent:** repeating it is a no-op that also returns `204`, and the first read time is kept. |
 | `DELETE` | `/notifications/{id}` | Dismisses one notification. `204`, no body. **Idempotent:** dismissing an already-dismissed notification also returns `204`. |
+| `GET` | `/notifications/preferences` | Returns `{ "data": { "preferences": [...] } }` for the authenticated user: the effective `social`, `engagement`, and `community` × `in_app` values. Missing rows default to `enabled: true`. Sends `Cache-Control: private, no-store`. |
+| `PATCH` | `/notifications/preferences` | Accepts `{ "preferences": [{ "category": "engagement", "channel": "in_app", "enabled": false }] }` and returns the updated effective matrix. Partial updates leave omitted tuples unchanged. Requires CSRF. Duplicate tuples, unknown categories/channels/fields, and non-boolean `enabled` values return `422 VALIDATION_FAILED`. |
+
+**Preference policy.** The API is self-scoped: identity comes only from the authenticated JWT principal; a caller-supplied user ID is rejected. The only supported channel is `in_app`; categories are `social`, `engagement`, and `community`. Defaults are enabled for all three categories. A central mapping in the Notifications service assigns the existing A1/A2 producer types to those categories. A disabled preference prevents creation of future notifications; it does not hide or alter existing rows and does not consume a deduplication key. Preference lookup errors fail closed for notification creation and are handled by each producer's existing best-effort behavior; the underlying social/content/community action is not rolled back. Quiet hours, locale, and push/email/SMS delivery are not exposed or enforced by this API.
 
 **List behavior**
 - **Cursor:** the standard opaque `(createdAt, id)` cursor of §9, ordered `createdAt` descending then `id` descending. This is the same shape as posts, comments and messages, and **not** the `(last_message_at, id)` shape used by `GET /conversations` (§13). A malformed cursor is `400 INVALID_CURSOR`.
@@ -391,15 +395,14 @@ All routes require authentication (JWT). The two state-changing routes also requ
 **Read and dismiss**
 - An id that is not the caller's, does not exist, or (for read) has been dismissed is `404 RESOURCE_NOT_FOUND`, the same answer for all three, so ids cannot be probed. A malformed id is `422 VALIDATION_FAILED` (field `id`), not a `500`.
 - Dismissing is a **soft delete**: the row stays, its deduplication key stays claimed (so a replayed domain event cannot bring a dismissed notification back), and its read state is left as it was. Dismissing does not mark a notification read.
-- Both `GET` routes send `Cache-Control: private, no-store`. There is no WebSocket event for notifications (§13).
+- All `GET` routes send `Cache-Control: private, no-store`. There is no WebSocket event for notifications (§13).
 
 **Rate limiting: not currently enforced.** No rate limit applies to these routes, and no Notifications-specific limits are defined yet; a future account-keyed policy remains to be decided and implemented (see the implementation status in §11).
 
 **Not built (this is what "implemented" does not cover)**
 - **Notification producers.** A1 producers cover follows and friend requests; A2 producers cover post/comment reactions, comments/replies and community membership approval. Messaging and moderation notification producers are not implemented.
-- **Preferences endpoints** (`/notification-preferences`) and producer preference enforcement, even though the table exists; both require a separate product/API design decision.
 - **Read-all**, deferred by the owner for the MVP and not part of the approved scope.
-- **Deliveries** (push, email, SMS) and notification preferences remain deferred. Implemented producer type strings are documented in the producer implementations; the database field remains plain text.
+- **Deliveries** (push, email, SMS) remain deferred. The notification type, category, and channel columns remain plain text in the database; the supported in-app category/channel vocabulary and producer mapping are application policy.
 - **Retention:** no retention period has been decided and nothing purges or expires notification rows.
 
 ## 16. Database consistency findings
@@ -438,7 +441,7 @@ No missing constraints, ambiguous relationships, or concurrency risks were found
 | Rate-limit exact thresholds (§11) | Tunable without a design change | Open — illustrative starting values given; production tuning deferred |
 | Audit trail for auth/authz failures | Security observability | Open — blocked on `audit` schema (Database Phase 2), not an API design gap |
 | Communities API implementation | Database layer exists; no REST API yet | Open — contract to be finalized before implementation |
-| Notifications: producers, preferences endpoints, read-all, deliveries, type vocabulary, retention | The four core routes are implemented (§15); these are the parts around them | Open. Retention and the type/category vocabulary are open decisions; read-all is deferred by the owner for the MVP; deliveries (push/email/SMS) are not started |
+| Notifications: read-all, deliveries, retention | Core notification routes and preference API are implemented (§15) | Read-all is deferred by the owner for the MVP; deliveries (push/email/SMS) are not started; retention remains an open decision |
 | Feed/Media/Moderation/Admin/Search implementation | All remaining §15 rows | Open — blocked on their Database Phase 2 modules, contracts defined so implementation won't retrofit badly |
 
 ### Tracked API follow-ups
